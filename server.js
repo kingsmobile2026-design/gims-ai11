@@ -4,6 +4,10 @@ const { Readable } = require('stream');
 const block = require('./block');
 const dbmod = require('./db');
 const reasoning = require('./reasoning');
+const store = require('./tools/store');
+const TOOLS = require('./tools');
+const WS = require('./tools/workspace');
+const { AGENT_SYSTEM } = require('./tools/agent');
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_IPS = (process.env.ADMIN_IPS || '').split(',').map(s => s.trim()).filter(Boolean); // 관리자(화이트리스트) IP
@@ -111,6 +115,18 @@ const readBody = async (req, res, opts) => {
   return clean;
 };
 
+
+// 원본 본문을 제한 크기까지 읽는다 (데이터셋 업로드용). 초과 시 연결을 끊는다.
+const rawBody = (req, max) => new Promise((ok, no) => {
+  let n = 0; const chunks = [];
+  req.on('data', c => {
+    n += c.length;
+    if (n > max) { no(Object.assign(new Error('파일이 너무 큽니다 (10MB 이하)'), { status: 413 })); req.destroy(); return; }
+    chunks.push(c);
+  });
+  req.on('end', () => ok(Buffer.concat(chunks).toString('utf8')));
+  req.on('error', no);
+});
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x'), p = url.pathname, m = req.method;
@@ -330,6 +346,75 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // ----- 데이터셋 업로드 (본인만 조회·사용, 최대 10MB, 메모리 저장) -----
+    if (p === '/api/data') {
+      if (m === 'GET') return send(res, 200, { datasets: store.list(a.user), stats: store.stats() });
+      if (m === 'POST') {
+        const len = Number(req.headers['content-length'] || 0);
+        if (len > store.MAX_DATASET) return fail(res, 413, '파일은 10MB 이하여야 합니다.');
+        let text;
+        try { text = await rawBody(req, store.MAX_DATASET); }
+        catch (e) { return fail(res, e.status || 400, e.message); }
+        const name = String(url.searchParams.get('name') || 'dataset').replace(/[^\w.\-가-힣 ]/g, '_').slice(0, 80);
+        if (!/\.(csv|json|txt|tsv)$/i.test(name)) return fail(res, 415, 'csv, json, txt, tsv 파일만 지원합니다 (파일 이름 확장자 확인).');
+        if (!text.trim()) return fail(res, 400, '빈 파일입니다.');
+        try { return send(res, 200, store.put(a.user, name, text)); }
+        catch (e) { return fail(res, 413, e.message); }
+      }
+      return fail(res, 405, '허용되지 않는 메서드입니다.');
+    }
+    if (p.startsWith('/api/data/') && m === 'DELETE') {
+      const id = decodeURIComponent(p.slice('/api/data/'.length));
+      const ok = store.remove(a.user, id);
+      return send(res, ok ? 200 : 404, { ok });
+    }
+
+    // ----- 작업 공간: AI가 만든 파일 조회·다운로드 -----
+    if (p === '/api/workspace' && m === 'GET') return send(res, 200, { files: WS.listFiles(a.user), stats: WS.stats(a.user) });
+    if (p === '/api/workspace' && m === 'DELETE') { WS.clear(a.user); return send(res, 200, { ok: true }); }
+    if (p === '/api/workspace/file' && m === 'GET') {
+      try {
+        const c = WS.readFile(a.user, url.searchParams.get('path') || '');
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
+        return res.end(c);
+      } catch (e) { return fail(res, 404, e.message); }
+    }
+    if (p === '/api/workspace/zip' && m === 'GET') {
+      try {
+        const buf = WS.zip(a.user);
+        res.writeHead(200, { 'Content-Type': 'application/zip', 'Content-Disposition': 'attachment; filename="workspace.zip"', 'Content-Length': buf.length, 'Cache-Control': 'no-store' });
+        return res.end(buf);
+      } catch (e) { return fail(res, 404, e.message); }
+    }
+
+    // ----- 에이전트: AI가 작업 공간에 파일을 직접 만들고 검사한다 (1회 = 질문 4회분) -----
+    if (p === '/api/agent' && m === 'POST') {
+      const apiKey = getKey();
+      if (!apiKey) return fail(res, 503, '관리자가 아직 API 키를 등록하지 않았습니다.');
+      const uu = users[a.user];
+      if (uu && uu.banned) return fail(res, 403, '차단된 계정입니다.');
+      const COST = 4;
+      const usedNow = usedOf(a, req), limNow = limitOf(a);
+      if (!a.admin && usedNow + COST > limNow) return fail(res, 429, `에이전트는 질문 ${COST}회분이 차감됩니다. 오늘 남은 한도가 부족해요.`);
+      const _b = await readBody(req, res, { types: ['proto'] }); if (!_b) return;
+      const { model, message } = _b;
+      if (!/^[\w.\-]+$/.test(model || '') || typeof message !== 'string' || !message.trim() || message.length > 4000) return fail(res, 400, '잘못된 요청입니다.');
+      if (!a.admin) { bump('u:' + a.user, COST); bump('ip:' + ip(req), COST); }
+      const refund = () => { if (!a.admin) { bump('u:' + a.user, -COST); bump('ip:' + ip(req), -COST); } };
+      const ac = new AbortController(); res.on('close', () => ac.abort());
+      try {
+        const r = await TOOLS.runToolLoop({
+          base: BASE, key: apiKey, model, system: AGENT_SYSTEM, groups: ['workspace', 'coding'], mode: 'AUTO', maxRounds: 10, temperature: 0.3,
+          signal: ac.signal, owner: a.user,
+          contents: [{ role: 'user', parts: [{ text: message }] }]
+        });
+        return send(res, 200, { text: r.text, trace: r.trace, files: WS.listFiles(a.user) });
+      } catch (e) {
+        refund();
+        return fail(res, 502, e.message || '에이전트 실행에 실패했습니다.');
+      }
+    }
+
     // ----- 채팅 (모든 기기가 관리자가 등록한 키를 사용) -----
     if (p === '/api/chat' && m === 'POST') {
       const apiKey = getKey();
@@ -361,7 +446,7 @@ const server = http.createServer(async (req, res) => {
       let sendContents = contents, sysInst = SYSTEM_INSTRUCTION;
       if (lv) {   // DeepSeek-R1 방식: 분석 → 풀이 N개 → 검증 → 수정 → (아래에서) 최종 답 스트리밍
         try {
-          const r = await reasoning.prepare({ base: BASE, key: apiKey, model, contents, level: lv, signal: ac.signal, onStep: g => emit({ gims: g }) });
+          const r = await reasoning.prepare({ base: BASE, key: apiKey, model, contents, level: lv, signal: ac.signal, onStep: g => emit({ gims: g }), owner: a.user, datasets: store.list(a.user) });
           sendContents = r.contents; sysInst = { parts: [...SYSTEM_INSTRUCTION.parts, { text: r.system }] };
           console.log('[reason]', a.user, reason.level, JSON.stringify(r.stats));
         } catch (e) {
