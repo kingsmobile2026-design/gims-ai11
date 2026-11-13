@@ -1,5 +1,5 @@
 /**
- * db.js — 저장소 계층. MONGODB_URI 가 있으면 MongoDB, 없으면 기존처럼 data/ JSON 파일.
+ * db.js — 저장소 계층. DB 또는 MONGODB_URI 가 있으면 MongoDB, 없으면 기존처럼 data/ JSON 파일.
  * 저장 대상: API 키(config), 사용자(users), 세션(sessions), 사용량(usage), 채팅방(rooms)
  */
 'use strict';
@@ -27,7 +27,8 @@ function fileBackend(dataDir) {
     async allRooms() {
       try { return fs.readdirSync(roomsDir).filter(f => f.endsWith('.json')).map(f => [f.slice(0, -5), rdJson(path.join(roomsDir, f), null)]).filter(x => x[1]); } catch { return []; }
     },
-    async flushAll() {}, async close() {}
+    async flushAll() {}, async close() {},
+    async logReason() {}
   };
 }
 
@@ -37,8 +38,9 @@ async function mongoBackend(uri, dbName) {
   const client = new MongoClient(uri, { serverSelectionTimeoutMS: 15000 });
   await client.connect();
   const d = client.db(dbName);
-  const C = { cfg: d.collection('config'), users: d.collection('users'), sessions: d.collection('sessions'), usage: d.collection('usage'), rooms: d.collection('rooms') };
+  const C = { cfg: d.collection('config'), users: d.collection('users'), sessions: d.collection('sessions'), usage: d.collection('usage'), rooms: d.collection('rooms'), reasons: d.collection('reasons') };
   await C.sessions.createIndex({ expAt: 1 }, { expireAfterSeconds: 0 });   // 만료 세션 자동 삭제
+  await C.reasons.createIndex({ at: 1 }, { expireAfterSeconds: 60 * 60 * 24 * 30 }); // 추론 로그 30일 보관
 
   // Mongo 필드명에 '.' 가 들어가면 곤란하므로 usage.n 은 [키,값] 배열로 저장
   const enc = {
@@ -87,6 +89,11 @@ async function mongoBackend(uri, dbName) {
     save(col, obj) { pending[col] = SINGLE.has(col) ? { main: obj } : obj; },   // 실제 저장은 아래 1초 타이머가 변경분만 upsert
     async getRoom(u) { const doc = await C.rooms.findOne({ _id: u }); return doc ? strip(doc) : EMPTY_ROOM(); },
     async setRoom(u, dd) { await C.rooms.replaceOne({ _id: u }, dd, { upsert: true }); },   // 문서 1개 = 한 사용자의 채팅방 전체 (16MB 한도)
+    async logReason(entry) {
+      try {
+        await C.reasons.insertOne({ ...entry, at: new Date() });
+      } catch (e) { console.warn('[mongo] reason log 실패', e.message); }
+    },
     async flushAll() { for (const col of Object.keys(snaps)) await run(col); },
     async close() { clearInterval(iv); await api.flushAll(); await client.close(); }
   };
@@ -97,7 +104,7 @@ async function mongoBackend(uri, dbName) {
 // ---------- 초기화 (+ 기존 data/ 파일이 있고 Mongo 가 비어 있으면 1회 이전) ----------
 async function init({ uri, dbName, dataDir }) {
   const file = fileBackend(dataDir);
-  if (!uri) { console.log('[db] MONGODB_URI 없음 → 로컬 JSON 파일 사용:', dataDir); file.data = await file.load(); return file; }
+  if (!uri) { console.log('[db] DB/MONGODB_URI 없음 → 로컬 JSON 파일 사용:', dataDir); file.data = await file.load(); return file; }
   const mongo = await mongoBackend(uri, dbName);
   mongo.data = await mongo.load();
   const empty = !Object.keys(mongo.data.users).length && !mongo.data.cfg.apiKey;

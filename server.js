@@ -4,10 +4,10 @@ const { Readable } = require('stream');
 const block = require('./block');
 const dbmod = require('./db');
 const reasoning = require('./reasoning');
-const store = require('./tools/store');
-const TOOLS = require('./tools');
-const WS = require('./tools/workspace');
-const { AGENT_SYSTEM } = require('./tools/agent');
+const store = require('./store');
+const TOOLS = require('./tool_registry');
+const WS = require('./workspace');
+const { AGENT_SYSTEM } = require('./agent');
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_IPS = (process.env.ADMIN_IPS || '').split(',').map(s => s.trim()).filter(Boolean); // 관리자(화이트리스트) IP
@@ -43,7 +43,7 @@ const ROOMS = path.join(DATA, 'rooms');
 console.log('[data] 저장 경로:', DATA);
 
 // ---------- 저장소 (메모리 캐시 + MongoDB 또는 JSON 파일) ----------
-// MONGODB_URI 환경변수가 있으면 MongoDB 에 API 키·사용자·세션·사용량·채팅방을 모두 저장
+// DB 또는 MONGODB_URI 환경변수가 있으면 MongoDB 에 API 키·사용자·세션·사용량·채팅방·추론 로그를 모두 저장
 let db;
 const cfg = {}, users = {}, sess = {};
 let usage = { day: '', n: {} };
@@ -53,17 +53,17 @@ const cnt = k => { if (usage.day !== today()) usage = { day: today(), n: {} }; r
 const bump = (k, d) => { cnt(k); usage.n[k] = Math.max(0, (usage.n[k] || 0) + d); saveUse(); };
 
 // ---------- 관리자 계정 ----------
-// ADMIN_PASS 환경변수를 주면 매 시작 때 그 값으로 설정(비밀번호 교체용). 없고 계정도 없으면 임의 비밀번호를 만들어 콘솔에 1회 출력.
+// AD_PASS 또는 ADMIN_PASS 환경변수를 주면 매 시작 때 그 값으로 설정(비밀번호 교체용). 없고 계정도 없으면 임의 비밀번호를 만들어 콘솔에 1회 출력.
 const ADMIN_USER = 'admin';
 const getKey = () => cfg.apiKey || envKey();
 function ensureAdmin() {
-  const env = process.env.ADMIN_PASS;
+  const env = process.env.AD_PASS || process.env.ADMIN_PASS;
   if (users[ADMIN_USER] && !env) return;
   const pass = env || crypto.randomBytes(9).toString('base64url');
   const salt = crypto.randomBytes(16).toString('hex');
   users[ADMIN_USER] = { salt, hash: crypto.scryptSync(pass, salt, 64).toString('hex'), isAdmin: true, email: '', emailVerified: true };
   saveUsers();
-  console.log(env ? '관리자(admin) 비밀번호를 ADMIN_PASS 값으로 설정했습니다.' : `관리자 계정이 생성되었습니다: admin / ${pass}  (지금만 표시됩니다. 저장하세요)`);
+  console.log(env ? '관리자(admin) 비밀번호를 AD_PASS/ADMIN_PASS 값으로 설정했습니다.' : `관리자 계정이 생성되었습니다: admin / ${pass}  (지금만 표시됩니다. 저장하세요)`);
 }
 
 // ---------- 시스템 프롬프트 (Gims AI 세뇌) ----------
@@ -404,7 +404,7 @@ const server = http.createServer(async (req, res) => {
       const ac = new AbortController(); res.on('close', () => ac.abort());
       try {
         const r = await TOOLS.runToolLoop({
-          base: BASE, key: apiKey, model, system: AGENT_SYSTEM, groups: ['workspace', 'coding'], mode: 'AUTO', maxRounds: 10, temperature: 0.3,
+          base: BASE, key: apiKey, model, system: AGENT_SYSTEM, groups: ['workspace', 'coding', 'vserver', 'sandbox'], mode: 'AUTO', maxRounds: 14, temperature: 0.3,
           signal: ac.signal, owner: a.user,
           contents: [{ role: 'user', parts: [{ text: message }] }]
         });
@@ -441,6 +441,37 @@ const server = http.createServer(async (req, res) => {
       const early = !!lv;
       const emit = o => { if (!res.writableEnded) res.write('data: ' + JSON.stringify(o) + '\n\n'); };
       const openSSE = () => { res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no', ...H(usedOf(a, req)) }); res.flushHeaders(); };
+
+      // 파일/프로젝트 생성 요청 → 도구로 실제 파일 생성 (마크다운 코드블록 대신)
+      const lastText = (() => {
+        try { return (contents[contents.length - 1]?.parts || []).map(x => x.text || '').join(' '); }
+        catch { return ''; }
+      })();
+      const wantsFiles = !lv && /파일\s*(만들|생성|저장)|만들어\s*줘|작성해\s*줘|프로젝트\s*만들|index\.html|zip\s*(으로|로)|워크스페이스|실제\s*파일|코드\s*파일\s*만들/i.test(lastText);
+      if (wantsFiles) {
+        openSSE();
+        try {
+          emit({ gims: { id: 'files', label: '파일 생성 도구 실행', state: 'start' } });
+          const r = await TOOLS.runToolLoop({
+            base: BASE, key: apiKey, model,
+            system: AGENT_SYSTEM + '\n' + (SYSTEM_INSTRUCTION.parts[0]?.text || ''),
+            groups: ['workspace', 'coding', 'vserver', 'sandbox'], mode: 'AUTO', maxRounds: 14, temperature: 0.25,
+            signal: ac.signal, owner: a.user, contents
+          });
+          const files = WS.listFiles(a.user);
+          emit({ gims: { id: 'files', label: '파일 생성 완료', state: 'done', ms: 0, detail: files.map(f => f.path).join(', ').slice(0, 160) } });
+          const tip = files.length ? '\n\n📁 작업 공간 파일: ' + files.map(f => f.path).join(', ') + '\n다운로드: GET /api/workspace/zip' : '';
+          emit({ candidates: [{ content: { parts: [{ text: (r.text || '') + tip }] } }] });
+          emit({ gims: { used: usedOf(a, req) } });
+          return res.end();
+        } catch (e) {
+          if (ac.signal.aborted && res.destroyed) { refund(); return res.end(); }
+          console.warn('[files] 도구 실패 → 일반 응답:', e.message);
+          emit({ gims: { id: 'files', label: '파일 도구 실패 → 일반 답변', state: 'done', ms: 0, detail: String(e.message || '').slice(0, 80) } });
+          // fall through
+        }
+      }
+
       if (early) openSSE();
 
       let sendContents = contents, sysInst = SYSTEM_INSTRUCTION;
@@ -449,6 +480,8 @@ const server = http.createServer(async (req, res) => {
           const r = await reasoning.prepare({ base: BASE, key: apiKey, model, contents, level: lv, signal: ac.signal, onStep: g => emit({ gims: g }), owner: a.user, datasets: store.list(a.user) });
           sendContents = r.contents; sysInst = { parts: [...SYSTEM_INSTRUCTION.parts, { text: r.system }] };
           console.log('[reason]', a.user, reason.level, JSON.stringify(r.stats));
+          // 채팅·API·추론 단계/생각을 Mongo에 기록 (1초 주기 flush와 별도로 즉시 insert)
+          db.logReason && db.logReason({ user: a.user, level: reason.level, model, stats: r.stats, system: String(r.system || '').slice(0, 4000), q: String((contents[contents.length-1]?.parts||[]).map(x=>x.text||'').join('')).slice(0, 2000) }).catch(()=>{});
         } catch (e) {
           if (ac.signal.aborted && res.destroyed) { refund(); return res.end(); }
           console.warn('[reason] 실패 → 일반 응답으로 대체:', e.message);
@@ -484,7 +517,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 (async () => {
-  db = await dbmod.init({ uri: process.env.MONGODB_URI, dbName: process.env.MONGODB_DB || 'gimsai', dataDir: DATA });
+  db = await dbmod.init({ uri: process.env.DB || process.env.MONGODB_URI, dbName: process.env.MONGODB_DB || 'gimsai', dataDir: DATA });
   Object.assign(cfg, db.data.cfg); Object.assign(users, db.data.users); Object.assign(sess, db.data.sess); usage = db.data.usage;
   ensureAdmin();
   server.listen(PORT, () => console.log(`Gims AI → http://localhost:${PORT}  [저장소: ${db.kind}]  (관리자 IP: ${ADMIN_IPS.join(', ') || '없음'}, 기본 일일 한도: ${DAILY_LIMIT}, 인증 보너스: +${VERIFY_BONUS})`));

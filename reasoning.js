@@ -21,20 +21,21 @@
  */
 'use strict';
 const crypto = require('crypto');
-const TOOLS = require('./tools');
+const TOOLS = require('./tool_registry');
 
 // 추론 정도. cost = 하루 질문 한도에서 차감되는 횟수, budget = Gemini 사고 토큰 예산
 const LEVELS = {
-  low:    { label: '낮음', samples: 1, plan: false, refute: false, revise: 0, budget: 0,     cost: 2,  timeout: 60_000,  desc: '풀이 1개 + 검증' },
-  medium: { label: '보통', samples: 3, plan: true,  refute: false, revise: 0, budget: 4096,  cost: 4,  timeout: 120_000, desc: '분석 + 서로 다른 방식 풀이 최대 3개 + 합의도 + 검증' },
-  high:   { label: '높음', samples: 4, plan: true,  refute: true,  revise: 1, budget: 8192,  cost: 7,  timeout: 200_000, desc: '분석 + 풀이 최대 4개 + 합의도 + 검증·반박 + 오류 수정 1회' },
-  max:    { label: '최대', samples: 5, plan: true,  refute: true,  revise: 2, budget: 16384, cost: 10, timeout: 300_000, desc: '분석 + 풀이 최대 5개 + 합의도 + 검증·반박 + 오류 수정 최대 2회' }
+  // 생각(다단계 추론)은 유지하되, 호출 수·사고토큰·타임아웃을 줄여 체감 속도를 올린다
+  low:    { label: '낮음', samples: 1, plan: false, refute: false, revise: 0, budget: 0,    cost: 2, timeout: 20_000, desc: '빠른 풀이 1회 + 짧은 검증' },
+  medium: { label: '보통', samples: 1, plan: false, refute: false, revise: 0, budget: 512,  cost: 3, timeout: 35_000, desc: '풀이 1회 + 검증 (분석 생략으로 속도 우선)' },
+  high:   { label: '높음', samples: 2, plan: true,  refute: false, revise: 0, budget: 1024, cost: 5, timeout: 55_000, desc: '짧은 분석 + 풀이 최대 2회 + 검증' },
+  max:    { label: '최대', samples: 2, plan: true,  refute: true,  revise: 1, budget: 2048, cost: 7, timeout: 80_000, desc: '분석 + 풀이 2회 + 검증·반박 + 수정 1회' }
 };
 const info = () => Object.fromEntries(Object.entries(LEVELS).map(([k, v]) => [k, { label: v.label, cost: v.cost, desc: v.desc }]));
 
-const TEMPS = [0.3, 0.7, 1.0, 0.5, 0.9];
-const HARD_GRACE_MS = 30_000;   // 선택 단계 마감 뒤에도 진행 중인 요청을 기다리는 최대 시간
-const MIN_STAGE_MS = 25_000;    // 이보다 적게 남았으면 수정·재검토를 시작하지 않음
+const TEMPS = [0.2, 0.5, 0.8, 0.35, 0.6];
+const HARD_GRACE_MS = 6_000;    // 선택 단계 마감 뒤 대기 (짧게)
+const MIN_STAGE_MS = 5_000;     // 남은 시간이 이보다 적으면 추가 단계 생략
 const SEED_MOD = 2147483647;    // Gemini seed는 int32 범위
 
 const STRATEGIES = [
@@ -135,7 +136,7 @@ async function gen({ base, key, model, contents, system, temperature, seed, sign
           ...(tools ? { tools } : {}),
           generationConfig: {
             temperature,
-            maxOutputTokens: b + 8192,
+            maxOutputTokens: Math.min(4096, (b || 0) + 2048),
             ...(seed != null ? { seed } : {}),
             ...(schema ? { responseMimeType: 'application/json', responseSchema: schema } : {}),
             ...(b ? { thinkingConfig: { thinkingBudget: b } } : {})
@@ -145,7 +146,7 @@ async function gen({ base, key, model, contents, system, temperature, seed, sign
       if (r.ok) return r.json();
       const bodyText = await r.text().catch(() => '');
       if ((r.status === 429 || r.status >= 500) && i < 2) {
-        await sleep(1000 * 2 ** i + Math.random() * 500, signal);
+        await sleep(400 * 2 ** i + Math.random() * 200, signal);
         continue;
       }
       const e = new Error(`Gemini ${r.status}`);
@@ -273,7 +274,8 @@ async function prepare({ base, key, model, contents, signal, level, onStep, owne
 
     // 신뢰도 기반 스케줄링: 먼저 2개만 돌리고, 둘이 일치하면 나머지 생략 (코드는 실행 검증이 있으므로 항상 전부)
     const N = L.samples;
-    const firstN = Math.min(N, isCode ? N : 2);
+    // 코드가 아니면 1개만 먼저 돌리고, 합의되면 추가 생략 → 체감 속도 향상
+    const firstN = Math.min(N, isCode ? N : 1);
     let drafts = (await Promise.all([...Array(firstN).keys()].map(draftOne))).filter(Boolean);
     const ds1 = vote(drafts);
     const converged = ds1 && ds1.size === ds1.total && ds1.size >= 2;
@@ -321,7 +323,7 @@ async function prepare({ base, key, model, contents, signal, level, onStep, owne
               ...common, contents: [{ role: 'user', parts: [{ text: `## 질문\n${q}\n\n## 후보 코드\n\`\`\`\n${lead.code}\n\`\`\`\n\n## 후보 설명\n${lead.answer}` }] }],
               system: EXEC_VERIFY_SYS, temperature: 0.1, budget: 0, tools: [{ codeExecution: {} }]
             });
-            c = await ask({ ...common, contents: [{ role: 'user', parts: [{ text: `## 질문\n${q}\n\n## 실행 검증 로그\n${log}\n\n${voteLine()}` }] }], system: CRITIC_SYS + CODE_CRITIC_EXTRA, temperature: 0.1, budget: Math.min(L.budget, 4096) }, CRITIC_SCHEMA);
+            c = await ask({ ...common, contents: [{ role: 'user', parts: [{ text: `## 질문\n${q}\n\n## 실행 검증 로그\n${log}\n\n${voteLine()}` }] }], system: CRITIC_SYS + CODE_CRITIC_EXTRA, temperature: 0.1, budget: Math.min(L.budget || 0, 512) }, CRITIC_SCHEMA);
           } else {
             c = await ask({ ...common, contents: [{ role: 'user', parts: [{ text: `## 질문\n${q}\n\n${voteLine()}\n\n## 풀이들\n${view()}` }] }], system: CRITIC_SYS, temperature: 0.2, budget: L.budget }, CRITIC_SCHEMA);
           }
@@ -385,7 +387,7 @@ async function prepare({ base, key, model, contents, signal, level, onStep, owne
           : '';
         const candidate = `## 질문\n${q}\n\n## 후보 답\n${clip(lead0.answer, 2500)}${lead0.code ? `\n\n## 후보 코드\n${clip(lead0.code, 3000)}` : ''}${dsNote}\n\n도구로 핵심 계산·검사를 직접 수행하라.`;
         const tr = await TOOLS.runToolLoop({
-          base, key, model, system: TOOL_CHECK_SYS, groups, mode: 'ANY', maxRounds: 4, temperature: 0.1,
+          base, key, model, system: TOOL_CHECK_SYS, groups, mode: 'ANY', maxRounds: 2, temperature: 0.1,
           signal: hard.signal, owner,
           contents: [{ role: 'user', parts: [{ text: candidate }] }]
         });
