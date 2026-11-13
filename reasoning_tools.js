@@ -45,7 +45,62 @@ const FUNCS = {
 };
 const CONSTS = { pi: Math.PI, e: Math.E };
 
+/** LaTeX / 유니코드 수식 → 식 파서가 읽을 수 있는 평문 */
+function normalizeMathInput(src) {
+  let s = String(src ?? '');
+  s = s.replace(/\\\(|\\\)|\\\[|\\\]/g, '');
+  s = s.replace(/\$\$/g, '').replace(/\$/g, '');
+  for (let k = 0; k < 8; k++) {
+    const n = s.replace(/\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, '(($1)/($2))');
+    if (n === s) break;
+    s = n;
+  }
+  s = s.replace(/\\dfrac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, '(($1)/($2))');
+  s = s.replace(/\\sqrt\s*\{([^{}]*)\}/g, 'sqrt($1)');
+  s = s.replace(/\\sqrt\s*([A-Za-z0-9]+)/g, 'sqrt($1)');
+  s = s.replace(/\\cdot|\\times|\\ast|×|·/g, '*');
+  s = s.replace(/\\div|÷/g, '/');
+  s = s.replace(/\\pm/g, '+');
+  s = s.replace(/\\mp/g, '-');
+  s = s.replace(/\\leq|\\le|≤/g, '<=');
+  s = s.replace(/\\geq|\\ge|≥/g, '>=');
+  s = s.replace(/\\neq|\\ne|≠/g, '!=');
+  s = s.replace(/\\infty|∞/g, 'Infinity');
+  s = s.replace(/\^{([^{}]+)}/g, '^($1)');
+  s = s.replace(/_{([^{}]+)}/g, '_$1');
+  s = s.replace(/\\left\s*/g, '').replace(/\\right\s*/g, '');
+  s = s.replace(/\\,/g, '').replace(/\\;/g, '').replace(/\\!/g, '').replace(/\\quad/g, ' ').replace(/\\qquad/g, ' ');
+  s = s.replace(/\\pi\b/g, 'pi');
+  s = s.replace(/\\sin\b/g, 'sin').replace(/\\cos\b/g, 'cos').replace(/\\tan\b/g, 'tan');
+  s = s.replace(/\\log\b/g, 'log').replace(/\\ln\b/g, 'ln').replace(/\\exp\b/g, 'exp');
+  s = s.replace(/\\abs\s*\{([^{}]*)\}/g, 'abs($1)');
+  s = s.replace(/\\[a-zA-Z]+/g, '');
+  const sup = { '⁰':'0','¹':'1','²':'2','³':'3','⁴':'4','⁵':'5','⁶':'6','⁷':'7','⁸':'8','⁹':'9' };
+  s = s.replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹]/g, ch => '^' + (sup[ch] || ''));
+  // 함수·상수 이름을 보호한 뒤 인접 문자 변수에 암묵 곱셈 삽입 (ab → a*b)
+  const protect = [...Object.keys(FUNCS), ...Object.keys(CONSTS)].sort((a, b) => b.length - a.length);
+  const ph = new Map();
+  protect.forEach((k, i) => {
+    const token = `__P${i}__`;
+    if (s.includes(k)) { ph.set(token, k); s = s.split(k).join(token); }
+  });
+  s = s.replace(/(\d)([A-Za-z(])/g, '$1*$2');
+  s = s.replace(/([A-Za-z])(\d)/g, '$1*$2');
+  for (let i = 0; i < 8; i++) {
+    const n = s.replace(/([A-Za-z])([A-Za-z])/g, '$1*$2');
+    if (n === s) break;
+    s = n;
+  }
+  s = s.replace(/\)\s*\(/g, ')*(');
+  s = s.replace(/\)\s*([A-Za-z])/g, ')*$1');
+  s = s.replace(/([A-Za-z0-9])\s*\(/g, '$1*(');
+  for (const [token, k] of ph) s = s.split(token).join(k);
+  s = s.replace(/\s+/g, '');
+  return s;
+}
+
 function tokenize(src) {
+  src = normalizeMathInput(src);
   const out = [];
   const re = /\s*(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|[A-Za-z_]\w*|[-+*/^%(),])/y;
   let pos = 0;
@@ -53,7 +108,7 @@ function tokenize(src) {
     if (/^\s*$/.test(src.slice(pos))) break;
     re.lastIndex = pos;
     const m = re.exec(src);
-    if (!m) throw new Error(`식에서 알 수 없는 문자 위치 ${pos}`);
+    if (!m) throw new Error(`식에서 알 수 없는 문자 위치 ${pos}: '${src.slice(pos, pos + 12)}'`);
     out.push(m[1]);
     pos = re.lastIndex;
     if (out.length > 300) throw new Error('식의 토큰이 너무 많습니다');
@@ -225,12 +280,37 @@ MATH.verify_root = ({ expr, var: v = 'x', value, tol = 1e-9 }) => {
 };
 
 MATH.number_theory = ({ op, a, b, m, n }) => {
+  const gcd2 = (x, y) => { x = x < 0n ? -x : x; y = y < 0n ? -y : y; while (y) [x, y] = [y, x % y]; return x; };
+  const isSq = (x) => {
+    if (x < 0n) return false;
+    if (x <= 1n) return true;
+    let lo = 1n, hi = x;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1n, sq = mid * mid;
+      if (sq === x) return true;
+      if (sq < x) lo = mid + 1n; else hi = mid - 1n;
+    }
+    return false;
+  };
+  const isqrt = (x) => {
+    if (x < 0n) throw new Error('음수의 제곱근');
+    if (x <= 1n) return x;
+    let lo = 1n, hi = x, ans = 1n;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1n, sq = mid * mid;
+      if (sq === x) return mid;
+      if (sq < x) { ans = mid; lo = mid + 1n; } else hi = mid - 1n;
+    }
+    return ans;
+  };
   switch (op) {
-    case 'gcd': { let x = big(a, 'a'), y = big(b, 'b'); if (x < 0n) x = -x; if (y < 0n) y = -y; while (y) [x, y] = [y, x % y]; return { value: x.toString() }; }
+    case 'gcd': return { value: gcd2(big(a, 'a'), big(b, 'b')).toString() };
     case 'lcm': {
-      let x = big(a, 'a'), y = big(b, 'b'); if (x < 0n) x = -x; if (y < 0n) y = -y;
-      let g = x, h = y; while (h) [g, h] = [h, g % h];
-      return { value: g === 0n ? '0' : ((x / g) * y).toString() };
+      const x = big(a, 'a'), y = big(b, 'b');
+      if (x === 0n || y === 0n) return { value: '0' };
+      const g = gcd2(x, y);
+      let v = (x / g) * y; if (v < 0n) v = -v;
+      return { value: v.toString() };
     }
     case 'modpow': {
       let base = big(a, 'a'), e = big(b, 'b'), mod = big(m, 'm');
@@ -239,14 +319,15 @@ MATH.number_theory = ({ op, a, b, m, n }) => {
       while (e > 0n) { if (e & 1n) r = (r * base) % mod; base = (base * base) % mod; e >>= 1n; }
       return { value: r.toString() };
     }
-    case 'is_prime': return { value: isPrime(big(a, 'a')) };
+    case 'is_prime': return { value: isPrime(big(a, 'a')), n: String(a) };
     case 'factorize': {
-      let x = big(a, 'a'); if (x < 2n) throw new Error('2 이상이어야 합니다');
+      let x = big(a, 'a'); if (x < 0n) x = -x;
+      if (x < 2n) return { factors: [], n: x.toString() };
       if (x > 10n ** 14n) throw new Error('인수분해는 1e14 이하만 지원합니다');
       const f = []; let p = 2n;
       while (p * p <= x) { let c = 0; while (x % p === 0n) { x /= p; c++; } if (c) f.push(`${p}^${c}`); p += p === 2n ? 1n : 2n; }
       if (x > 1n) f.push(`${x}^1`);
-      return { factors: f.join(' * ') };
+      return { factors: f.join(' * '), n: String(a) };
     }
     case 'binom': {
       const N = big(a, 'a'), K = big(b, 'b');
@@ -261,9 +342,55 @@ MATH.number_theory = ({ op, a, b, m, n }) => {
       let r = 1n; for (let i = 2n; i <= N; i++) r *= i;
       return { value: r.toString(), digits: r.toString().length };
     }
-    default: throw new Error(`알 수 없는 op: ${op} (gcd, lcm, modpow, is_prime, factorize, binom, factorial)`);
+    case 'divides': {
+      const d = big(a, 'a'), n0 = big(b, 'b');
+      if (d === 0n) throw new Error('0 으로 나눌 수 없습니다');
+      const q = n0 / d, r = n0 % d;
+      return { divides: r === 0n, divisor: d.toString(), dividend: n0.toString(), quotient: q.toString(), remainder: r.toString() };
+    }
+    case 'divmod': {
+      const d = big(a, 'a'), n0 = big(b, 'b');
+      if (d === 0n) throw new Error('0 으로 나눌 수 없습니다');
+      return { quotient: (n0 / d).toString(), remainder: (n0 % d).toString() };
+    }
+    case 'is_square': {
+      const x = big(a, 'a');
+      const ok = isSq(x);
+      return { value: ok, n: x.toString(), sqrt: ok ? isqrt(x).toString() : null };
+    }
+    case 'isqrt': return { value: isqrt(big(a, 'a')).toString(), n: String(a) };
+    case 'egcd': {
+      let A = big(a, 'a'), B = big(b, 'b');
+      let x0 = 1n, y0 = 0n, x1 = 0n, y1 = 1n;
+      while (B !== 0n) {
+        const q = A / B;
+        [A, B] = [B, A - q * B];
+        [x0, x1] = [x1, x0 - q * x1];
+        [y0, y1] = [y1, y0 - q * y1];
+      }
+      let g = A; let xx = x0, yy = y0;
+      if (g < 0n) { g = -g; xx = -xx; yy = -yy; }
+      return { gcd: g.toString(), x: xx.toString(), y: yy.toString(), identity: `${a}*${xx} + ${b}*${yy} = ${g}` };
+    }
+    case 'invmod': {
+      const aa = big(a, 'a'), mm = big(b != null ? b : m, 'm');
+      if (mm <= 0n) throw new Error('mod > 0');
+      let A = ((aa % mm) + mm) % mm, B = mm;
+      let x0 = 1n, x1 = 0n;
+      while (B !== 0n) {
+        const q = A / B;
+        [A, B] = [B, A - q * B];
+        [x0, x1] = [x1, x0 - q * x1];
+      }
+      if (A !== 1n && A !== -1n) throw new Error('역원이 없습니다 (서로소 아님)');
+      if (A === -1n) x0 = -x0;
+      const inv = ((x0 % mm) + mm) % mm;
+      return { value: inv.toString(), a: aa.toString(), m: mm.toString() };
+    }
+    default: throw new Error(`알 수 없는 op: ${op} (gcd, lcm, modpow, is_prime, factorize, binom, factorial, divides, divmod, is_square, isqrt, egcd, invmod)`);
   }
 };
+
 function isPrime(n) {
   if (n < 2n) return false;
   for (const p of [2n, 3n, 5n, 7n, 11n, 13n, 17n, 19n, 23n, 29n, 31n, 37n]) { if (n === p) return true; if (n % p === 0n) return false; }
@@ -278,6 +405,111 @@ function isPrime(n) {
   }
   return true;
 }
+
+MATH.eval_integer = ({ expr, vars }) => {
+  const e = str(expr, 'expr', MAX_EXPR * 2);
+  const env = {};
+  if (vars && typeof vars === 'object') {
+    for (const [k, v] of Object.entries(vars)) env[k] = Number(v);
+  }
+  const plain = normalizeMathInput(e);
+  const val = evalAst(parseExpr(plain), env);
+  const nearest = Math.round(val);
+  const isInt = Number.isFinite(val) && Math.abs(val - nearest) < 1e-9;
+  return { value: val, integer: isInt, as_int: isInt ? nearest : null, normalized: plain };
+};
+
+MATH.divisibility_search = ({ num_expr, den_expr, vars = ['a', 'b'], max = 40, require_square = false, positive = true }) => {
+  const ne = str(num_expr, 'num_expr', MAX_EXPR * 2);
+  const de = str(den_expr, 'den_expr', MAX_EXPR * 2);
+  const names = Array.isArray(vars) && vars.length ? vars.map(String).slice(0, 3) : ['a', 'b'];
+  const M = Math.min(Math.max(3, Number(max) || 40), 80);
+  const nAst = parseExpr(ne);
+  const dAst = parseExpr(de);
+  const hits = [];
+  const start = positive ? 1 : -M;
+  const ranges = names.map(() => {
+    const arr = [];
+    for (let i = start; i <= M; i++) if (i !== 0 || !positive) arr.push(i);
+    return arr;
+  });
+  let scanned = 0;
+  const limit = 25000;
+  function rec(depth, env) {
+    if (hits.length >= 40 || scanned >= limit) return;
+    if (depth === names.length) {
+      scanned++;
+      try {
+        const nv = evalAst(nAst, env), dv = evalAst(dAst, env);
+        if (!Number.isFinite(nv) || !Number.isFinite(dv) || dv === 0) return;
+        const Ni = Math.round(nv), Di = Math.round(dv);
+        if (Math.abs(nv - Ni) > 1e-8 || Math.abs(dv - Di) > 1e-8) return;
+        if (Ni % Di !== 0) return;
+        const q = Ni / Di;
+        const qAbs = Math.abs(q);
+        const root = Math.round(Math.sqrt(qAbs));
+        const sq = root * root === qAbs;
+        if (require_square && !sq) return;
+        hits.push({ vars: { ...env }, numerator: Ni, denominator: Di, quotient: q, is_square: sq, sqrt: sq ? root * Math.sign(q || 1) : null });
+      } catch { /* skip */ }
+      return;
+    }
+    for (const v of ranges[depth]) {
+      env[names[depth]] = v;
+      rec(depth + 1, env);
+      if (hits.length >= 40 || scanned >= limit) return;
+    }
+  }
+  rec(0, {});
+  return {
+    hits: hits.slice(0, 30),
+    scanned,
+    num_normalized: normalizeMathInput(ne),
+    den_normalized: normalizeMathInput(de),
+    note: hits.length
+      ? `조건 만족 ${hits.length}개 예시. 몫이 제곱인 비율은 증명 힌트가 될 수 있음.`
+      : '범위 안에서 예시 없음. 식·변수·범위를 조정하거나 대수적 증명을 진행하라.'
+  };
+};
+
+MATH.poly_div_hint = ({ a, b }) => {
+  const A = big(a, 'a'), B = big(b, 'b');
+  const num = A * A + B * B;
+  const den = A * B + 1n;
+  if (den === 0n) throw new Error('ab+1 = 0');
+  const q = num / den, r = num % den;
+  const isSq = (x) => {
+    if (x < 0n) return false;
+    let lo = 0n, hi = x;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1n, sq = mid * mid;
+      if (sq === x) return true;
+      if (sq < x) lo = mid + 1n; else hi = mid - 1n;
+    }
+    return false;
+  };
+  const candidates = [];
+  for (let k = 0n; k <= 30n; k++) {
+    const rem = num - k * den;
+    if (rem === 0n || isSq(rem)) candidates.push({ k: k.toString(), remainder: rem.toString(), remainder_is_square: isSq(rem) });
+  }
+  return {
+    a: A.toString(), b: B.toString(),
+    numerator: num.toString(), denominator: den.toString(),
+    quotient: q.toString(), remainder: r.toString(), divides: r === 0n,
+    identity_check: `${A}^2+${B}^2 = ${q}*(${A}*${B}+1) + ${r}`,
+    small_k_scan: candidates.slice(0, 12),
+    quotient_is_square: r === 0n && isSq(q < 0n ? -q : q),
+    hint: r === 0n
+      ? '나누어떨어짐. 몫이 제곱인지는 number_theory is_square 로 확인.'
+      : '이 값에서는 나누어떨어지지 않음. 증명 시 대칭·강하(descent) 아이디어를 사용.'
+  };
+};
+
+MATH.normalize_math = ({ text }) => {
+  const raw = str(text, 'text', 4000);
+  return { normalized: normalizeMathInput(raw), original: raw };
+};
 
 MATH.solve_linear = ({ matrix, rhs }) => {
   if (!Array.isArray(matrix) || !matrix.length || matrix.length > 12) throw new Error('행렬은 1~12 크기여야 합니다');
@@ -433,8 +665,16 @@ const DECL = {
       parameters: OBJ({ lhs: S('STRING', '좌변 식'), rhs: S('STRING', '우변 식'), var: S('STRING', '변수'), lo: S('NUMBER', '검사 구간 시작'), hi: S('NUMBER', '검사 구간 끝'), samples: S('INTEGER', '검사 점 개수') }, ['lhs', 'rhs']) },
     { name: 'verify_root', description: '제시한 해 value 가 f(x)=0 을 만족하는지 대입해 확인한다.',
       parameters: OBJ({ expr: S('STRING', 'f(x)'), var: S('STRING', '변수'), value: S('NUMBER', '후보 해'), tol: S('NUMBER', '허용 오차') }, ['expr', 'value']) },
-    { name: 'number_theory', description: '정수론 계산. op: gcd, lcm, modpow(a^b mod m), is_prime, factorize, binom(nCk: a=n, b=k), factorial. 큰 정수는 문자열로 넘겨도 된다.',
-      parameters: OBJ({ op: S('STRING', '연산 종류', { enum: ['gcd', 'lcm', 'modpow', 'is_prime', 'factorize', 'binom', 'factorial'] }), a: S('STRING', '첫 번째 정수'), b: S('STRING', '두 번째 정수 (필요할 때)'), m: S('STRING', '법 (modpow)') }, ['op', 'a']) },
+    { name: 'number_theory', description: '정수론. op: gcd,lcm,modpow,is_prime,factorize,binom,factorial,divides(a|b),divmod,is_square,isqrt,egcd,invmod.',
+      parameters: OBJ({ op: S('STRING', '연산', { enum: ['gcd', 'lcm', 'modpow', 'is_prime', 'factorize', 'binom', 'factorial', 'divides', 'divmod', 'is_square', 'isqrt', 'egcd', 'invmod'] }), a: S('STRING', '첫 정수'), b: S('STRING', '둘째 정수/mod'), m: S('STRING', 'modpow 법') }, ['op', 'a']) },
+    { name: 'normalize_math', description: 'LaTeX/유니코드 수식(\\( a \\) , \\frac{a^2+b^2}{ab+1}, 1/2)을 평문 식으로 변환.',
+      parameters: OBJ({ text: S('STRING', '원문 수식') }, ['text']) },
+    { name: 'eval_integer', description: '정수 변수로 식 평가. LaTeX 허용. 예: (a^2+b^2)/(a*b+1)',
+      parameters: OBJ({ expr: S('STRING', '식'), vars: { type: 'OBJECT', description: '변수→숫자' } }, ['expr']) },
+    { name: 'divisibility_search', description: 'num이 den으로 나누어떨어지는 정수 조합 탐색 + 몫이 완전제곱인지. 예: a^2+b^2 , a*b+1',
+      parameters: OBJ({ num_expr: S('STRING', '분자'), den_expr: S('STRING', '분모'), vars: { type: 'ARRAY', items: { type: 'STRING' } }, max: S('INTEGER', '탐색 상한'), require_square: S('BOOLEAN', '제곱만'), positive: S('BOOLEAN', '양의 정수만') }, ['num_expr', 'den_expr']) },
+    { name: 'poly_div_hint', description: '(a^2+b^2)/(ab+1) 나눗셈·제곱 여부 스캔. 정수 나눗셈 증명 보조.',
+      parameters: OBJ({ a: S('STRING', 'a'), b: S('STRING', 'b') }, ['a', 'b']) },
     { name: 'solve_linear', description: '선형 연립방정식 Ax=b 풀이 및 행렬식. rhs 를 생략하면 행렬식만 계산.',
       parameters: OBJ({ matrix: { type: 'ARRAY', items: { type: 'ARRAY', items: { type: 'NUMBER' } }, description: '정사각행렬' }, rhs: { type: 'ARRAY', items: { type: 'NUMBER' }, description: '우변 벡터 (선택)' } }, ['matrix']) },
     { name: 'quadratic', description: '이차방정식 ax²+bx+c=0 의 근 (판별식, 복소근 포함).',
@@ -452,4 +692,4 @@ const DECL = {
   ]
 };
 
-module.exports = { MATH, CODING, DECL, parseExpr, compile };
+module.exports = { MATH, CODING, DECL, parseExpr, compile, normalizeMathInput };
