@@ -22,6 +22,7 @@
 'use strict';
 const crypto = require('crypto');
 const TOOLS = require('./tool_registry');
+const gemini = require('./gemini');
 
 // 추론 정도. cost = 하루 질문 한도에서 차감되는 횟수, budget = Gemini 사고 토큰 예산
 const LEVELS = {
@@ -126,42 +127,26 @@ const noBudget = new Set();
 async function gen({ base, key, model, contents, system, temperature, seed, signal, budget, schema, tools }) {
   const useBudget = budget && !noBudget.has(model) ? budget : 0;
 
-  const post = async b => {
-    for (let i = 0; ; i++) {
-      const r = await fetch(`${base}/v1beta/models/${model}:generateContent`, {
-        method: 'POST', signal, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-        body: JSON.stringify({
-          contents,
-          systemInstruction: { parts: [{ text: system }] },
-          ...(tools ? { tools } : {}),
-          generationConfig: {
-            temperature,
-            maxOutputTokens: Math.min(4096, (b || 0) + 2048),
-            ...(seed != null ? { seed } : {}),
-            ...(schema ? { responseMimeType: 'application/json', responseSchema: schema } : {}),
-            ...(b ? { thinkingConfig: { thinkingBudget: b } } : {})
-          }
-        })
-      });
-      if (r.ok) return r.json();
-      const bodyText = await r.text().catch(() => '');
-      if ((r.status === 429 || r.status >= 500) && i < 2) {
-        await sleep(400 * 2 ** i + Math.random() * 200, signal);
-        continue;
-      }
-      const e = new Error(`Gemini ${r.status}`);
-      e.status = r.status; e.body = bodyText;
-      throw e;
+  const buildBody = b => ({
+    contents,
+    systemInstruction: { parts: [{ text: system }] },
+    ...(tools ? { tools } : {}),
+    generationConfig: {
+      temperature,
+      maxOutputTokens: Math.min(4096, (b || 0) + 2048),
+      ...(seed != null ? { seed } : {}),
+      ...(schema ? { responseMimeType: 'application/json', responseSchema: schema } : {}),
+      ...(b ? { thinkingConfig: { thinkingBudget: b } } : {})
     }
-  };
+  });
 
   let j;
   try {
-    j = await post(useBudget);
+    j = await gemini.generateContent({ base, key, model, body: buildBody(useBudget), signal });
   } catch (e) {
-    if (e.status === 400 && useBudget) {
-      if (/thinking/i.test(e.body || '')) noBudget.add(model);
-      j = await post(0);
+    if (e.status === 400 && useBudget && /thinking/i.test(e.body || '')) {
+      noBudget.add(model);
+      j = await gemini.generateContent({ base, key, model, body: buildBody(0), signal });
     } else throw e;
   }
   const cand = (j.candidates || [])[0];
@@ -276,11 +261,21 @@ async function prepare({ base, key, model, contents, signal, level, onStep, owne
     const N = L.samples;
     // 코드가 아니면 1개만 먼저 돌리고, 합의되면 추가 생략 → 체감 속도 향상
     const firstN = Math.min(N, isCode ? N : 1);
-    let drafts = (await Promise.all([...Array(firstN).keys()].map(draftOne))).filter(Boolean);
+    // 병렬 호출은 분당 쿼터를 빨리 소진하므로 순차 실행
+    let drafts = [];
+    for (let i = 0; i < firstN; i++) {
+      if (aborted() || left() < MIN_STAGE_MS / 2) break;
+      const d = await draftOne(i).catch(() => null);
+      if (d) drafts.push(d);
+    }
     const ds1 = vote(drafts);
     const converged = ds1 && ds1.size === ds1.total && ds1.size >= 2;
     if (N > firstN && !converged) {
-      drafts.push(...(await Promise.all([...Array(N - firstN).keys()].map(k => draftOne(firstN + k)))).filter(Boolean));
+      for (let k = firstN; k < N; k++) {
+        if (aborted() || left() < MIN_STAGE_MS / 2) break;
+        const d = await draftOne(k).catch(() => null);
+        if (d) drafts.push(d);
+      }
     } else if (N > firstN) {
       st.start('early', '조기 종료'); st.done('early', `앞의 ${firstN}개 풀이가 일치 → 추가 풀이 생략`);
     }

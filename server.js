@@ -8,6 +8,7 @@ const store = require('./store');
 const TOOLS = require('./tool_registry');
 const WS = require('./workspace');
 const { AGENT_SYSTEM } = require('./agent');
+const gemini = require('./gemini');
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_IPS = (process.env.ADMIN_IPS || '').split(',').map(s => s.trim()).filter(Boolean); // 관리자(화이트리스트) IP
@@ -499,15 +500,13 @@ const server = http.createServer(async (req, res) => {
       };
       let up;
       try {
-        up = await fetch(`${BASE}/v1beta/models/${model}:streamGenerateContent?alt=sse`, {
-          method: 'POST', signal: ac.signal, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-          body: JSON.stringify({ contents: sendContents, systemInstruction: sysInst, generationConfig: gen })
+        up = await gemini.streamGenerateContent({
+          base: BASE, key: apiKey, model, signal: ac.signal,
+          body: { contents: sendContents, systemInstruction: sysInst, generationConfig: gen }
         });
-      } catch (e) { return bail(502, 'Gemini에 연결하지 못했습니다.'); }
-      if (!up.ok) {
-        const raw = await up.text();
-        let msg = raw.slice(0, 200); try { msg = JSON.parse(raw).error.message || msg; } catch {}
-        return bail(up.status, msg, raw);
+      } catch (e) {
+        const msg = e.friendly ? e.message : (e.message || 'Gemini에 연결하지 못했습니다.');
+        return bail(e.status === 429 ? 429 : 502, msg);
       }
       if (!early) openSSE();
       return Readable.fromWeb(up.body).on('error', () => res.end()).pipe(res);

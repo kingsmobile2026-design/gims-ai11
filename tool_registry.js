@@ -1,3 +1,4 @@
+const gemini = require('./gemini');
 'use strict';
 // 추론 도구 등록소: 그룹별 선언, 데이터셋 ID 해석, 인자 검증, 비동기 실행, Gemini 함수 호출 루프
 const core = require('./reasoning_tools');
@@ -125,22 +126,16 @@ async function runToolLoop({ base, key, model, contents, system, groups = ['math
   const ctx = { base, key, model, owner, userConfirmedWrite };
   for (let round = 0; round < maxRounds; round++) {
     const useMode = round === 0 ? mode : (mode === 'ANY' ? 'AUTO' : mode);
-    const r = await fetch(`${base}/v1beta/models/${model}:generateContent`, {
-      method: 'POST', signal, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-      body: JSON.stringify({
+    const body = await gemini.generateContent({
+      base, key, model, signal,
+      body: {
         contents: convo,
         systemInstruction: { parts: [{ text: system }] },
         tools: declarationsFor(groups),
         toolConfig: { functionCallingConfig: { mode: useMode, ...(useMode === 'ANY' ? { allowedFunctionNames: names } : {}) } },
         generationConfig: { temperature }
-      })
+      }
     });
-    if (!r.ok) {
-      let detail = '';
-      try { detail = (await r.json())?.error?.message || ''; } catch {}
-      throw new Error(detail ? `Gemini ${r.status}: ${detail}` : `Gemini ${r.status}`);
-    }
-    const body = await r.json();
     const parts = body.candidates?.[0]?.content?.parts || [];
     if (!parts.length && body.promptFeedback) {
       throw new Error('모델이 응답을 거부했습니다: ' + JSON.stringify(body.promptFeedback).slice(0, 200));
