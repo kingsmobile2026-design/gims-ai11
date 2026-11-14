@@ -21,9 +21,17 @@ const MAX_EXPR = 500, MAX_CODE = 60_000, MAX_OUT = 4000;
 // 공통 유틸
 // ======================================================================
 const num = (v, name) => {
-  const n = typeof v === 'string' ? Number(v) : v;
+  let n = typeof v === 'string' ? Number(v) : v;
+  if (typeof v === 'string' && !Number.isFinite(n) && v.trim()) {   // 'pi/2', '-inf', '2^10' 같은 상수식 허용
+    try { n = evalAst(parseExpr(v), {}); } catch { /* 아래에서 오류 */ }
+  }
   if (typeof n !== 'number' || !Number.isFinite(n)) throw new Error(`${name} 는 유한한 숫자여야 합니다`);
   return n;
+};
+const numInf = (v, name) => {
+  if (typeof v === 'string' && /^\s*[+-]?\s*(inf|infinity|∞)\s*$/i.test(v)) return /^\s*-/.test(v) ? -Infinity : Infinity;
+  if (v === Infinity || v === -Infinity) return v;
+  return num(v, name);
 };
 const big = (v, name) => {
   try { return BigInt(String(v).trim()); } catch { throw new Error(`${name} 는 정수여야 합니다`); }
@@ -41,9 +49,32 @@ const FUNCS = {
   sin: Math.sin, cos: Math.cos, tan: Math.tan, asin: Math.asin, acos: Math.acos, atan: Math.atan,
   log: Math.log, ln: Math.log, log10: Math.log10, log2: Math.log2, exp: Math.exp, sqrt: Math.sqrt,
   abs: Math.abs, floor: Math.floor, ceil: Math.ceil, round: Math.round,
-  min: Math.min, max: Math.max
+  min: Math.min, max: Math.max,
+  sinh: Math.sinh, cosh: Math.cosh, tanh: Math.tanh, asinh: Math.asinh, acosh: Math.acosh, atanh: Math.atanh,
+  cbrt: Math.cbrt, sign: Math.sign, trunc: Math.trunc, pow: Math.pow, atan2: Math.atan2, hypot: Math.hypot,
+  sec: x => 1 / Math.cos(x), csc: x => 1 / Math.sin(x), cot: x => 1 / Math.tan(x),
+  deg: x => (x * 180) / Math.PI, rad: x => (x * Math.PI) / 180, mod: (a, b) => ((a % b) + b) % b,
+  fact: x => factN(x), factorial: x => factN(x), gamma: x => gammaFn(x),
+  comb: (n, k) => combN(n, k), perm: (n, k) => { let r = 1; for (let i = 0; i < k; i++) r *= n - i; return r; },
+  gcd: (a, b) => { a = Math.abs(a); b = Math.abs(b); while (b) [a, b] = [b, a % b]; return a; },
+  lcm: (a, b) => { const g = FUNCS.gcd(a, b); return g ? Math.abs(a / g * b) : 0; },
+  fib: n => { let a = 0, b = 1; for (let i = 0; i < n; i++) [a, b] = [b, a + b]; return a; }
 };
-const CONSTS = { pi: Math.PI, e: Math.E };
+function gammaFn(z) {
+  if (z < 0.5) return Math.PI / (Math.sin(Math.PI * z) * gammaFn(1 - z));
+  z -= 1;
+  const g = 7, c = [0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313, -176.61502916214059, 12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7];
+  let x = c[0]; for (let i = 1; i < g + 2; i++) x += c[i] / (z + i);
+  const t = z + g + 0.5;
+  return Math.sqrt(2 * Math.PI) * Math.pow(t, z + 0.5) * Math.exp(-t) * x;
+}
+function factN(x) {
+  if (!Number.isFinite(x) || x < 0) return NaN;
+  if (Number.isInteger(x)) { if (x > 170) return Infinity; let r = 1; for (let i = 2; i <= x; i++) r *= i; return r; }
+  return gammaFn(x + 1);
+}
+function combN(n, k) { if (k < 0 || k > n) return 0; k = Math.min(k, n - k); let r = 1; for (let i = 1; i <= k; i++) r = (r * (n - k + i)) / i; return Math.round(r); }
+const CONSTS = { pi: Math.PI, e: Math.E, tau: 2 * Math.PI, phi: (1 + Math.sqrt(5)) / 2, inf: Infinity };
 
 /** LaTeX / 유니코드 수식 → 식 파서가 읽을 수 있는 평문 */
 function normalizeMathInput(src) {
@@ -77,24 +108,29 @@ function normalizeMathInput(src) {
   s = s.replace(/\\[a-zA-Z]+/g, '');
   const sup = { '⁰':'0','¹':'1','²':'2','³':'3','⁴':'4','⁵':'5','⁶':'6','⁷':'7','⁸':'8','⁹':'9' };
   s = s.replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹]/g, ch => '^' + (sup[ch] || ''));
-  // 함수·상수 이름을 보호한 뒤 인접 문자 변수에 암묵 곱셈 삽입 (ab → a*b)
-  const protect = [...Object.keys(FUNCS), ...Object.keys(CONSTS)].sort((a, b) => b.length - a.length);
-  const ph = new Map();
-  protect.forEach((k, i) => {
-    const token = `__P${i}__`;
-    if (s.includes(k)) { ph.set(token, k); s = s.split(k).join(token); }
-  });
-  s = s.replace(/(\d)([A-Za-z(])/g, '$1*$2');
+  // 과학 표기(1e-5)와 함수·상수 이름을 보호한 뒤 암묵 곱셈(2x, ab, 2sin x)을 삽입한다
+  const sci = [];
+  s = s.replace(/\d+(?:\.\d+)?[eE][+-]?\d+/g, m => { sci.push(m); return `\u0005${String.fromCharCode(65 + sci.length - 1)}\u0006`; });
+  const fnNames = Object.keys(FUNCS).sort((x, y) => y.length - x.length);
+  const constNames = Object.keys(CONSTS).sort((x, y) => y.length - x.length);
+  const fph = new Map(), cph = new Map();
+  fnNames.forEach((k, i) => { const t = `\u0001${String.fromCharCode(97 + i)}\u0002`; if (s.includes(k)) { fph.set(t, k); s = s.split(k).join(t); } });
+  constNames.forEach((k, i) => { const t = `\u0003${String.fromCharCode(97 + i)}\u0004`; if (s.includes(k)) { cph.set(t, k); s = s.split(k).join(t); } });
+  s = s.replace(/(\d)([A-Za-z(\u0001\u0003])/g, '$1*$2');
   s = s.replace(/([A-Za-z])(\d)/g, '$1*$2');
+  s = s.replace(/([A-Za-z)\u0002\u0004\u0006])([\u0003\u0001])/g, '$1*$2');
+  s = s.replace(/([\u0004\u0006])([A-Za-z0-9(])/g, '$1*$2');
   for (let i = 0; i < 8; i++) {
     const n = s.replace(/([A-Za-z])([A-Za-z])/g, '$1*$2');
     if (n === s) break;
     s = n;
   }
   s = s.replace(/\)\s*\(/g, ')*(');
-  s = s.replace(/\)\s*([A-Za-z])/g, ')*$1');
-  s = s.replace(/([A-Za-z0-9])\s*\(/g, '$1*(');
-  for (const [token, k] of ph) s = s.split(token).join(k);
+  s = s.replace(/\)\s*([A-Za-z0-9])/g, ')*$1');
+  s = s.replace(/([A-Za-z0-9\u0004])\s*\(/g, '$1*(');
+  for (const [t, k] of fph) s = s.split(t).join(k);
+  for (const [t, k] of cph) s = s.split(t).join(k);
+  sci.forEach((m, i) => { s = s.split(`\u0005${String.fromCharCode(65 + i)}\u0006`).join(m); });
   s = s.replace(/\s+/g, '');
   return s;
 }
@@ -102,7 +138,7 @@ function normalizeMathInput(src) {
 function tokenize(src) {
   src = normalizeMathInput(src);
   const out = [];
-  const re = /\s*(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|[A-Za-z_]\w*|[-+*/^%(),])/y;
+  const re = /\s*(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|[A-Za-z_]\w*|[-+*/^%(),!])/y;
   let pos = 0;
   while (pos < src.length) {
     if (/^\s*$/.test(src.slice(pos))) break;
@@ -140,7 +176,8 @@ function parseExpr(src) {
     return power();
   };
   const power = () => {
-    const base = primary();
+    let base = primary();
+    while (peek() === '!') { eat(); base = { fn: 'fact', args: [base] }; }
     if (peek() === '^') { eat(); return { op: '^', a: base, b: unary() }; }   // 우결합
     return base;
   };
@@ -192,9 +229,13 @@ function evalAst(n, env) {
 }
 
 // 식을 한 번 파싱해 여러 값에 대해 빠르게 평가하는 함수 반환
+function zeroForm(src) {
+  const m = /^([^=<>!]*[^=<>!])=([^=][^=<>]*)$/.exec(src);   // 'x^2 = 4' → '(x^2)-(4)'
+  return m && !/[<>!]=|==/.test(src) ? `(${m[1]})-(${m[2]})` : src;
+}
 const compile = (src, variable = 'x') => {
   str(src, 'expr', MAX_EXPR);
-  const ast = parseExpr(src);
+  const ast = parseExpr(zeroForm(src));
   return (value, extra = {}) => evalAst(ast, { ...extra, [variable]: value });
 };
 
@@ -237,23 +278,42 @@ MATH.solve_numeric = ({ expr, var: v = 'x', lo, hi, samples = 4000 }) => {
   return { roots: uniq.slice(0, 50), scanned: N, note: uniq.length ? undefined : '구간 안에서 부호 변화를 찾지 못했습니다(중근이거나 구간이 부적절할 수 있음)' };
 };
 
-MATH.derivative_at = ({ expr, var: v = 'x', x }) => {
+MATH.derivative_at = ({ expr, var: v = 'x', x, order }) => {
   const f = compile(str(expr, 'expr', MAX_EXPR), v);
   const x0 = num(x, 'x');
-  const h = 1e-6 * Math.max(1, Math.abs(x0));
-  const d = (f(x0 + h) - f(x0 - h)) / (2 * h);
-  return { derivative: d, method: 'central difference', h };
+  const ord = Math.min(4, Math.max(1, Math.floor(Number(order) || 1)));
+  const h0 = Math.pow(1e-3, 1) * Math.max(1, Math.abs(x0));
+  // Richardson 외삽: h, h/2, h/4 의 중심차분을 조합해 정확도를 높인다
+  const cd = h => {
+    if (ord === 1) return (f(x0 + h) - f(x0 - h)) / (2 * h);
+    if (ord === 2) return (f(x0 + h) - 2 * f(x0) + f(x0 - h)) / (h * h);
+    if (ord === 3) return (f(x0 + 2 * h) - 2 * f(x0 + h) + 2 * f(x0 - h) - f(x0 - 2 * h)) / (2 * h ** 3);
+    return (f(x0 + 2 * h) - 4 * f(x0 + h) + 6 * f(x0) - 4 * f(x0 - h) + f(x0 - 2 * h)) / h ** 4;
+  };
+  const sc = ord <= 1 ? 1 : ord === 2 ? 20 : ord === 3 ? 60 : 200;
+  const T = [];
+  for (let i = 0; i < 4; i++) { T[i] = [cd(h0 / sc / 2 ** i)]; for (let j = 1; j <= i; j++) T[i][j] = T[i][j - 1] + (T[i][j - 1] - T[i - 1][j - 1]) / (4 ** j - 1); }
+  const d = T[3][3];
+  return { derivative: Number(d.toPrecision(12)), order: ord, method: 'Richardson 외삽 중심차분', errorEstimate: Math.abs(T[3][3] - T[2][2]) };
 };
 
 MATH.integrate = ({ expr, var: v = 'x', a, b, n = 1000 }) => {
   const f = compile(str(expr, 'expr', MAX_EXPR), v);
-  const A = num(a, 'a'), B = num(b, 'b');
+  const A = numInf(a, 'a'), B = numInf(b, 'b');
   let N = Math.min(Math.max(2, Math.floor(Number(n) || 1000)), 100000);
   if (N % 2) N++;
-  const h = (B - A) / N;
-  let s = f(A) + f(B);
-  for (let i = 1; i < N; i++) s += f(A + i * h) * (i % 2 ? 4 : 2);
-  return { value: (s * h) / 3, method: 'Simpson', intervals: N };
+  const simpson = M => { const h = (B - A) / M; let s = f(A) + f(B); for (let i = 1; i < M; i++) s += f(A + i * h) * (i % 2 ? 4 : 2); return (s * h) / 3; };
+  if (!Number.isFinite(A) || !Number.isFinite(B)) {   // 무한 구간: x = t/(1-t²) 치환
+    const g = t => { const x = t / (1 - t * t), dx = (1 + t * t) / ((1 - t * t) ** 2); return f(x) * dx; };
+    const lo = Number.isFinite(A) ? null : -1 + 1e-9, hi = Number.isFinite(B) ? null : 1 - 1e-9;
+    const mapA = Number.isFinite(A) ? ((-1 + Math.sqrt(1 + 4 * A * A)) / (2 * A || 1)) : lo, mapB = Number.isFinite(B) ? ((-1 + Math.sqrt(1 + 4 * B * B)) / (2 * B || 1)) : hi;
+    const a2 = A === 0 ? 0 : mapA, b2 = B === 0 ? 0 : mapB;
+    const hh = (b2 - a2) / N; let ss = g(a2) + g(b2);
+    for (let i = 1; i < N; i++) ss += g(a2 + i * hh) * (i % 2 ? 4 : 2);
+    return { value: (ss * hh) / 3, method: 'Simpson (무한 구간 치환)', intervals: N };
+  }
+  const v1 = simpson(N), v2 = simpson(2 * N);
+  return { value: v2, method: 'Simpson', intervals: 2 * N, errorEstimate: Math.abs(v2 - v1) / 15, reliable: Math.abs(v2 - v1) / 15 < 1e-7 * Math.max(1, Math.abs(v2)) };
 };
 
 MATH.check_identity = ({ lhs, rhs, var: v = 'x', lo = -10, hi = 10, samples = 200 }) => {
@@ -323,11 +383,9 @@ MATH.number_theory = ({ op, a, b, m, n }) => {
     case 'factorize': {
       let x = big(a, 'a'); if (x < 0n) x = -x;
       if (x < 2n) return { factors: [], n: x.toString() };
-      if (x > 10n ** 14n) throw new Error('인수분해는 1e14 이하만 지원합니다');
-      const f = []; let p = 2n;
-      while (p * p <= x) { let c = 0; while (x % p === 0n) { x /= p; c++; } if (c) f.push(`${p}^${c}`); p += p === 2n ? 1n : 2n; }
-      if (x > 1n) f.push(`${x}^1`);
-      return { factors: f.join(' * '), n: String(a) };
+      if (x > 10n ** 30n) throw new Error('인수분해는 1e30 이하만 지원합니다');
+      const fm = factorMap(x);
+      return { factors: [...fm].map(([p, e]) => `${p}^${e}`).join(' * '), n: String(a) };
     }
     case 'binom': {
       const N = big(a, 'a'), K = big(b, 'b');
@@ -387,10 +445,62 @@ MATH.number_theory = ({ op, a, b, m, n }) => {
       const inv = ((x0 % mm) + mm) % mm;
       return { value: inv.toString(), a: aa.toString(), m: mm.toString() };
     }
-    default: throw new Error(`알 수 없는 op: ${op} (gcd, lcm, modpow, is_prime, factorize, binom, factorial, divides, divmod, is_square, isqrt, egcd, invmod)`);
+    case 'totient': {
+      const fs = factorMap(big(a, 'a'));
+      let r = big(a, 'a'); for (const p of fs.keys()) r = (r / p) * (p - 1n);
+      return { value: r.toString() };
+    }
+    case 'divisors': {
+      const n0 = big(a, 'a'); if (n0 < 1n) throw new Error('양의 정수여야 합니다');
+      let ds = [1n];
+      for (const [p, e] of factorMap(n0)) { const nx = []; let pw = 1n; for (let i = 0; i <= e; i++) { for (const d of ds) nx.push(d * pw); pw *= p; } ds = nx; }
+      ds.sort((x, y) => (x < y ? -1 : 1));
+      return { count: ds.length, sum: ds.reduce((x, y) => x + y, 0n).toString(), divisors: ds.slice(0, 200).map(String) };
+    }
+    case 'nextprime': { let x = big(a, 'a') + 1n; for (let i = 0; i < 5000 && !isPrime(x); i++) x++; return { value: x.toString() }; }
+    case 'prevprime': { let x = big(a, 'a') - 1n; for (let i = 0; i < 5000 && x > 1n && !isPrime(x); i++) x--; return { value: x > 1n ? x.toString() : null }; }
+    case 'fib': { const N = Number(big(a, 'a')); if (N < 0 || N > 5000) throw new Error('0~5000'); let x = 0n, y = 1n; for (let i = 0; i < N; i++) [x, y] = [y, x + y]; return { value: x.toString() }; }
+    case 'digit_sum': return { value: String(big(a, 'a')).replace('-', '').split('').reduce((x, y) => x + Number(y), 0) };
+    case 'to_base': { const bs = Number(b); if (!(bs >= 2 && bs <= 36)) throw new Error('진법은 2~36'); return { value: big(a, 'a').toString(bs) }; }
+    case 'crt': {   // a = "r1,r2,..." , b = "m1,m2,..."
+      const rs = String(a).split(',').map(x => BigInt(x.trim())), ms = String(b).split(',').map(x => BigInt(x.trim()));
+      if (rs.length !== ms.length) throw new Error('나머지와 법의 개수가 다릅니다');
+      const inv = (x, m) => { let [g, y, x1] = [m, 0n, 1n], aa = ((x % m) + m) % m; let r0 = m, r1 = aa, t0 = 0n, t1 = 1n; while (r1) { const q = r0 / r1; [r0, r1] = [r1, r0 - q * r1]; [t0, t1] = [t1, t0 - q * t1]; } void g; void y; void x1; if (r0 !== 1n) throw new Error('법이 서로소가 아닙니다'); return ((t0 % m) + m) % m; };
+      let X = 0n, M = 1n;
+      for (let i = 0; i < rs.length; i++) { const k = (((rs[i] - X) % ms[i]) + ms[i]) % ms[i] * inv(M, ms[i]) % ms[i]; X += M * k; M *= ms[i]; }
+      return { value: X.toString(), modulus: M.toString() };
+    }
+    default: throw new Error(`알 수 없는 op: ${op}`);
   }
 };
 
+function factorMap(n) {
+  const out = new Map();
+  const gcdB = (x, y) => { while (y) [x, y] = [y, x % y]; return x < 0n ? -x : x; };
+  const rho = m => {
+    if (m % 2n === 0n) return 2n;
+    for (let c = 1n; c < 50n; c++) {
+      let x = 2n, y = 2n, d = 1n;
+      const f = v => (v * v + c) % m;
+      let it = 0;
+      while (d === 1n && it++ < 200000) { x = f(x); y = f(f(y)); d = gcdB(x - y, m); }
+      if (d !== 1n && d !== m) return d;
+    }
+    return m;
+  };
+  const rec = m => {
+    if (m === 1n) return;
+    if (isPrime(m)) { out.set(m, (out.get(m) || 0) + 1); return; }
+    let p = 2n;
+    for (const q of [2n, 3n, 5n, 7n, 11n, 13n, 17n, 19n, 23n, 29n, 31n, 37n]) if (m % q === 0n) { p = q; break; }
+    if (m % p === 0n && p < 40n) { out.set(p, (out.get(p) || 0) + 1); return rec(m / p); }
+    const d = rho(m);
+    if (d === m) { out.set(m, (out.get(m) || 0) + 1); return; }
+    rec(d); rec(m / d);
+  };
+  rec(n < 0n ? -n : n);
+  return new Map([...out].sort((a, b) => (a[0] < b[0] ? -1 : 1)));
+}
 function isPrime(n) {
   if (n < 2n) return false;
   for (const p of [2n, 3n, 5n, 7n, 11n, 13n, 17n, 19n, 23n, 29n, 31n, 37n]) { if (n === p) return true; if (n % p === 0n) return false; }
@@ -558,11 +668,12 @@ const CODING = {};
 CODING.check_js_syntax = ({ code }) => {
   const src = str(code, 'code', MAX_CODE);
   try {
-    new vm.Script(src, { filename: 'candidate.js' });   // 컴파일만 수행. 실행하지 않음
-    return { ok: true };
-  } catch (e) {
-    const m = /candidate\.js:(\d+)/.exec(e.stack || '');
-    return { ok: false, error: e.message, line: m ? Number(m[1]) : null };
+    const r = require('./js_analyzer').checkSyntax(src);   // ESM·최상위 await/return 도 허용, 줄·칸·원인 힌트 제공
+    if (r.ok) return { ok: true, module: !!r.module };
+    return { ok: false, error: r.message, line: r.line, col: r.col, hint: r.hint, frame: r.frame };
+  } catch {
+    try { new vm.Script(src, { filename: 'candidate.js' }); return { ok: true }; }
+    catch (e) { const m = /candidate\.js:(\d+)/.exec(e.stack || ''); return { ok: false, error: e.message, line: m ? Number(m[1]) : null }; }
   }
 };
 
@@ -614,14 +725,29 @@ CODING.find_bug_patterns = ({ code, language = 'js' }) => {
   const src = str(code, 'code', MAX_CODE);
   const lang = language === 'python' ? 'python' : 'js';
   const findings = [];
+  const maskLine = l => (lang === 'js'
+    ? l.replace(/\/\/.*$/, '').replace(/(["'`])(?:\\.|(?!\1).)*\1/g, m => m[0] + ' '.repeat(m.length - 2) + m[0])
+    : l.replace(/#.*$/, '').replace(/(["'])(?:\\.|(?!\1).)*\1/g, m => m[0] + ' '.repeat(m.length - 2) + m[0]));
   src.split('\n').forEach((line, i) => {
-    for (const [re, msg] of BUG_RULES[lang]) if (re.test(line)) findings.push({ line: i + 1, message: msg, text: line.trim().slice(0, 120) });
+    const mk = maskLine(line);
+    for (const [re, msg] of BUG_RULES[lang]) if (re.test(mk)) findings.push({ line: i + 1, message: msg, text: line.trim().slice(0, 120) });
   });
   return { language: lang, count: findings.length, findings: findings.slice(0, 60), note: '정적 패턴 기반 점검이므로 오탐이 있을 수 있습니다' };
 };
 
 CODING.estimate_loop_depth = ({ code, language = 'js' }) => {
   const src = str(code, 'code', MAX_CODE);
+  if (language !== 'python') {
+    try {
+      const A = require('./js_analyzer');
+      const r = A.analyzeJs(src, {});
+      if (r.functions.length) {
+        const worst = r.functions.slice().sort((x, y) => y.loopDepth - x.loopDepth || y.cyclomatic - x.cyclomatic);
+        const w = worst[0];
+        return { maxLoopNesting: w.loopDepth, estimate: A.complexityLabel(w), worst: w.name, functions: worst.slice(0, 6).map(f => ({ name: f.name, line: f.line, loopDepth: f.loopDepth, time: A.complexityLabel(f) })), note: '반복문+콜백(map/filter/…) 중첩, 루프 안 선형 탐색, 재귀를 반영한 AST 기반 추정' };
+      }
+    } catch { /* 아래 근사 방식으로 */ }
+  }
   const py = language === 'python';
   let maxDepth = 0, cur = 0;
   if (py) {
@@ -653,20 +779,20 @@ const OBJ = (properties, required) => ({ type: 'OBJECT', properties, required })
 
 const DECL = {
   math: [
-    { name: 'eval_expr', description: '수식을 정확히 계산한다. 사칙연산·^·sin/cos/log/sqrt 등 지원. 계산 결과를 추측하지 말고 이 도구로 확인하라.',
+    { name: 'eval_expr', description: '수식을 정확히 계산한다. 사칙연산·^·!·sin/cos/log/sqrt/gamma/comb/gcd 등 지원, 2x·3pi 같은 암묵 곱셈과 LaTeX 허용. 계산 결과를 추측하지 말고 이 도구로 확인하라.',
       parameters: OBJ({ expr: S('STRING', '예: 2^10 + sqrt(2)*3'), vars: S('OBJECT', '변수 값 맵 (선택)') }, ['expr']) },
     { name: 'solve_numeric', description: '한 변수 방정식 f(x)=0 의 실근을 구간에서 찾는다. 부호 변화 기반 탐색 + 이분법.',
-      parameters: OBJ({ expr: S('STRING', 'f(x) 식, 예: x^3 - 2*x - 5'), var: S('STRING', '변수 이름, 기본 x'), lo: S('NUMBER', '구간 시작'), hi: S('NUMBER', '구간 끝'), samples: S('INTEGER', '탐색 점 개수 (100~20000)') }, ['expr', 'lo', 'hi']) },
+      parameters: OBJ({ expr: S('STRING', 'f(x) 식 또는 방정식 (예: x^3 - 2*x - 5, x^2 = 4)'), var: S('STRING', '변수 이름, 기본 x'), lo: S('NUMBER', '구간 시작'), hi: S('NUMBER', '구간 끝'), samples: S('INTEGER', '탐색 점 개수 (100~20000)') }, ['expr', 'lo', 'hi']) },
     { name: 'derivative_at', description: '한 점에서의 미분값(중심차분 근사).',
-      parameters: OBJ({ expr: S('STRING', 'f(x)'), var: S('STRING', '변수'), x: S('NUMBER', '미분할 점') }, ['expr', 'x']) },
+      parameters: OBJ({ expr: S('STRING', 'f(x)'), var: S('STRING', '변수'), x: S('NUMBER', '미분할 점 (pi/3 같은 상수식도 가능)'), order: S('INTEGER', '미분 차수 1~4, 기본 1') }, ['expr', 'x']) },
     { name: 'integrate', description: '정적분 근사(Simpson 법칙).',
-      parameters: OBJ({ expr: S('STRING', 'f(x)'), var: S('STRING', '변수'), a: S('NUMBER', '하한'), b: S('NUMBER', '상한'), n: S('INTEGER', '구간 수(짝수, 최대 100000)') }, ['expr', 'a', 'b']) },
+      parameters: OBJ({ expr: S('STRING', 'f(x)'), var: S('STRING', '변수'), a: S('NUMBER', '하한 (pi/2, -inf 가능)'), b: S('NUMBER', '상한 (inf 가능)'), n: S('INTEGER', '구간 수(짝수, 최대 100000)') }, ['expr', 'a', 'b']) },
     { name: 'check_identity', description: '두 식이 같은 함수인지 여러 점에서 비교한다. 대수적 변형이 맞는지 검증할 때 사용.',
       parameters: OBJ({ lhs: S('STRING', '좌변 식'), rhs: S('STRING', '우변 식'), var: S('STRING', '변수'), lo: S('NUMBER', '검사 구간 시작'), hi: S('NUMBER', '검사 구간 끝'), samples: S('INTEGER', '검사 점 개수') }, ['lhs', 'rhs']) },
     { name: 'verify_root', description: '제시한 해 value 가 f(x)=0 을 만족하는지 대입해 확인한다.',
       parameters: OBJ({ expr: S('STRING', 'f(x)'), var: S('STRING', '변수'), value: S('NUMBER', '후보 해'), tol: S('NUMBER', '허용 오차') }, ['expr', 'value']) },
-    { name: 'number_theory', description: '정수론. op: gcd,lcm,modpow,is_prime,factorize,binom,factorial,divides(a|b),divmod,is_square,isqrt,egcd,invmod.',
-      parameters: OBJ({ op: S('STRING', '연산', { enum: ['gcd', 'lcm', 'modpow', 'is_prime', 'factorize', 'binom', 'factorial', 'divides', 'divmod', 'is_square', 'isqrt', 'egcd', 'invmod'] }), a: S('STRING', '첫 정수'), b: S('STRING', '둘째 정수/mod'), m: S('STRING', 'modpow 법') }, ['op', 'a']) },
+    { name: 'number_theory', description: '정수론(BigInt 정확 계산). op: gcd,lcm,modpow,is_prime,factorize(1e30까지, Pollard rho),binom,factorial,divides(a|b),divmod,is_square,isqrt,egcd,invmod,totient,divisors,nextprime,prevprime,fib,digit_sum,to_base(b=진법),crt(a="r1,r2", b="m1,m2").',
+      parameters: OBJ({ op: S('STRING', '연산', { enum: ['gcd', 'lcm', 'modpow', 'is_prime', 'factorize', 'binom', 'factorial', 'divides', 'divmod', 'is_square', 'isqrt', 'egcd', 'invmod', 'totient', 'divisors', 'nextprime', 'prevprime', 'fib', 'digit_sum', 'to_base', 'crt'] }), a: S('STRING', '첫 정수'), b: S('STRING', '둘째 정수/mod'), m: S('STRING', 'modpow 법') }, ['op', 'a']) },
     { name: 'normalize_math', description: 'LaTeX/유니코드 수식(\\( a \\) , \\frac{a^2+b^2}{ab+1}, 1/2)을 평문 식으로 변환.',
       parameters: OBJ({ text: S('STRING', '원문 수식') }, ['text']) },
     { name: 'eval_integer', description: '정수 변수로 식 평가. LaTeX 허용. 예: (a^2+b^2)/(a*b+1)',

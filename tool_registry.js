@@ -6,6 +6,8 @@ const data = require('./data');
 const bigdata = require('./bigdata');
 const coding = require('./coding');
 const codingPlus = require('./coding_plus');
+const codingAnalyzer = require('./coding_analyzer');
+const mathPlus = require('./math_plus');
 const external = require('./external');
 const sandbox = require('./sandbox');
 const predict = require('./predict');
@@ -14,8 +16,8 @@ const store = require('./store');
 const vserver = require('./vserver');
 
 const GROUPS = {
-  math:     { decl: core.DECL.math,                                                impl: core.MATH },
-  coding:   { decl: [...core.DECL.coding, ...coding.DECL, ...codingPlus.DECL],    impl: { ...core.CODING, ...coding.IMPL, ...codingPlus.IMPL } },
+  math:     { decl: [...core.DECL.math, ...mathPlus.DECL],                         impl: { ...core.MATH, ...mathPlus.IMPL } },
+  coding:   { decl: [...core.DECL.coding, ...coding.DECL, ...codingPlus.DECL, ...codingAnalyzer.DECL], impl: { ...core.CODING, ...coding.IMPL, ...codingPlus.IMPL, ...codingAnalyzer.IMPL } },
   data:     { decl: data.DECL,     impl: data.IMPL },
   bigdata:  { decl: bigdata.DECL,  impl: bigdata.IMPL },
   external: { decl: external.DECL, impl: external.IMPL },
@@ -56,8 +58,9 @@ const namesOf = groups => {
 
 const TYPE_OK = (v, t) => {
   switch (t) {
-    case 'NUMBER': case 'INTEGER': return typeof v === 'number' || (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v)));
-    case 'STRING': return typeof v === 'string';
+    case 'NUMBER': return typeof v === 'number' || (typeof v === 'string' && v.trim() !== '');
+    case 'INTEGER': return typeof v === 'number' || (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v)));
+    case 'STRING': return typeof v === 'string' || typeof v === 'number';
     case 'BOOLEAN': return typeof v === 'boolean';
     case 'ARRAY': return Array.isArray(v);
     case 'OBJECT': return typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -109,7 +112,7 @@ async function execute(name, args, { allowed, ctx = {} } = {}) {
     }
     const out = await withTimeout(Promise.resolve().then(() => t.impl(a, ctx)), 30_000);
     const json = JSON.stringify(out ?? {});
-    if (json.length > 6000) return { truncated: true, preview: json.slice(0, 5000) };
+    if (json.length > 9000) return { truncated: true, preview: json.slice(0, 8000) };
     return JSON.parse(json);
   } catch (e) {
     return { error: e.message };
