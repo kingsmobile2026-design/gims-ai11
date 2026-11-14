@@ -8,6 +8,7 @@ const coding = require('./coding');
 const codingPlus = require('./coding_plus');
 const codingAnalyzer = require('./coding_analyzer');
 const mathPlus = require('./math_plus');
+const mathProof = require('./math_proof');
 const external = require('./external');
 const sandbox = require('./sandbox');
 const predict = require('./predict');
@@ -16,7 +17,7 @@ const store = require('./store');
 const vserver = require('./vserver');
 
 const GROUPS = {
-  math:     { decl: [...core.DECL.math, ...mathPlus.DECL],                         impl: { ...core.MATH, ...mathPlus.IMPL } },
+  math:     { decl: [...core.DECL.math, ...mathPlus.DECL, ...mathProof.DECL],         impl: { ...core.MATH, ...mathPlus.IMPL, ...mathProof.IMPL } },
   coding:   { decl: [...core.DECL.coding, ...coding.DECL, ...codingPlus.DECL, ...codingAnalyzer.DECL], impl: { ...core.CODING, ...coding.IMPL, ...codingPlus.IMPL, ...codingAnalyzer.IMPL } },
   data:     { decl: data.DECL,     impl: data.IMPL },
   bigdata:  { decl: bigdata.DECL,  impl: bigdata.IMPL },
