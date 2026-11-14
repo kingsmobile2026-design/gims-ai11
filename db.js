@@ -19,6 +19,23 @@ const wrJson = (f, o) => {
   fs.renameSync(t, f);
 };
 const EMPTY_ROOM = () => ({ rev: 0, rooms: [], tomb: {} });
+
+// 모든 Mongo 작업에 시간 제한을 둔다. 죽은 연결(클라우드의 유휴 연결 종료 등)에서 무기한 대기하면
+// 컬렉션별 저장 큐 전체가 멈춰서 "몇 분 전 데이터까지만 저장"되는 증상이 된다.
+const OP_TIMEOUT = Math.max(2000, Number(process.env.MONGO_OP_TIMEOUT_MS) || 15000);
+const withTimeout = (p, label, ms = OP_TIMEOUT) => {
+  let t;
+  return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(new Error(`${label} ${ms}ms 시간 초과`)), ms); })]).finally(() => clearTimeout(t));
+};
+// 키별 직렬 실행 (같은 사용자의 채팅방 읽기→수정→쓰기가 겹쳐 서로 덮어쓰지 않게)
+const locks = new Map();
+function withLock(key, fn) {
+  const run = (locks.get(key) || Promise.resolve()).then(fn);
+  const tail = run.catch(() => {});
+  locks.set(key, tail);
+  tail.then(() => { if (locks.get(key) === tail) locks.delete(key); });
+  return run;
+}
 const SINGLE = new Set(['cfg', 'usage']);
 const clone = o => {
   try { return JSON.parse(JSON.stringify(o)); } catch (e) {
@@ -71,7 +88,13 @@ async function mongoBackend(uri, dbName) {
   const { MongoClient } = require('mongodb');
   const client = new MongoClient(uri, {
     serverSelectionTimeoutMS: 15000,
-    maxPoolSize: 10
+    connectTimeoutMS: 10000,
+    socketTimeoutMS: 30000,      // 응답 없는 죽은 소켓을 끊어 새 연결로 재시도하게 함 (기본값 0 = 무기한 대기)
+    maxIdleTimeMS: 60000,        // 유휴 연결을 먼저 닫아 클라우드 NAT/LB 의 조용한 연결 종료를 피함
+    heartbeatFrequencyMS: 10000,
+    maxPoolSize: 10,
+    retryWrites: true,
+    retryReads: true
   });
   await client.connect();
   const d = client.db(dbName);
@@ -133,8 +156,11 @@ async function mongoBackend(uri, dbName) {
     }
     try {
       if (ops.length) {
-        await C[col].bulkWrite(ops, { ordered: false });
-        if (process.env.DB_DEBUG === '1') console.log('[mongo] flush', col, 'ops', ops.length);
+        const t0 = Date.now();
+        await withTimeout(C[col].bulkWrite(ops, { ordered: false }), 'bulkWrite ' + col);
+        const ms = Date.now() - t0;
+        if (ms > 3000) console.warn('[mongo] 저장 지연', col, ms + 'ms');
+        if (process.env.DB_DEBUG === '1') console.log('[mongo] flush', col, 'ops', ops.length, ms + 'ms');
       }
       snaps[col] = cur;
     } catch (e) {
@@ -184,28 +210,34 @@ async function mongoBackend(uri, dbName) {
       else pending[col] = clone(obj);
       schedule(col);
     },
+    // 읽기 실패를 "빈 방 목록"으로 돌려주면 그 위에 쓰기가 일어나 기존 데이터가 지워진다 → 반드시 예외로 올린다
     async getRoom(u) {
-      try {
-        const doc = await C.rooms.findOne({ _id: u });
-        return doc ? strip(doc) : EMPTY_ROOM();
-      } catch (e) {
-        console.error('[mongo] getRoom 실패', u, e.message);
-        return EMPTY_ROOM();
+      for (let i = 0; ; i++) {
+        try {
+          const doc = await withTimeout(C.rooms.findOne({ _id: u }), 'getRoom');
+          return doc ? strip(doc) : EMPTY_ROOM();
+        } catch (e) {
+          console.error('[mongo] getRoom 실패', u, e.message);
+          if (i >= 1) throw e;
+        }
       }
     },
     async setRoom(u, dd) {
-      // 채팅은 즉시 저장 (1초 대기 없음)
+      // 채팅은 즉시 저장 (1초 대기 없음). 한 번 실패하면 새 연결로 재시도
       const body = clone(dd);
       delete body._id;
-      try {
-        await C.rooms.replaceOne({ _id: u }, body, { upsert: true });
-      } catch (e) {
-        console.error('[mongo] setRoom 실패', u, e.message);
-        throw e;
+      for (let i = 0; ; i++) {
+        try {
+          await withTimeout(C.rooms.replaceOne({ _id: u }, body, { upsert: true }), 'setRoom');
+          return;
+        } catch (e) {
+          console.error('[mongo] setRoom 실패', u, e.message);
+          if (i >= 1) throw e;
+        }
       }
     },
     async logReason(entry) {
-      try { await C.reasons.insertOne({ ...entry, at: new Date() }); }
+      try { await withTimeout(C.reasons.insertOne({ ...entry, at: new Date() }), 'logReason'); }
       catch (e) { console.warn('[mongo] reason log 실패', e.message); }
     },
     async flushAll() {
@@ -218,7 +250,8 @@ async function mongoBackend(uri, dbName) {
     async close() {
       clearInterval(iv);
       for (const t of Object.values(timers)) clearTimeout(t);
-      try { await api.flushAll(); } catch {}
+      try { await withTimeout(api.flushAll(), 'flushAll', 8000); } catch (e) { console.error('[mongo] 종료 전 저장 실패:', e.message); }
+      clearInterval(ping);
       try { await client.close(); } catch {}
     }
   };
@@ -229,21 +262,38 @@ async function mongoBackend(uri, dbName) {
       if (dirty[col]) run(col);
     }
   }, INTERVAL);
-  if (typeof iv.unref === 'function') { /* keep process alive for server */ }
+  // 연결 유지 + 끊김 조기 감지 (유휴 연결이 조용히 죽는 환경 대비)
+  const ping = setInterval(() => {
+    withTimeout(d.command({ ping: 1 }), 'ping', 8000).catch(e => console.warn('[mongo] ping 실패 → 다음 작업에서 재연결:', e.message));
+  }, 20000);
+  if (typeof ping.unref === 'function') ping.unref();
 
   console.log('[db] Mongo flush: debounce %dms, max interval %dms', DEBOUNCE, INTERVAL);
   return api;
 }
 
 // ---------- 초기화 ----------
+// 같은 사용자의 채팅방 읽기→수정→쓰기를 직렬화한다. mutate(d)가 false 를 돌려주면 쓰지 않는다.
+const withUpdateRoom = b => {
+  b.updateRoom = (u, mutate) => withLock('room:' + u, async () => {
+    const d = await b.getRoom(u);
+    if (!d.tomb) d.tomb = {};
+    if (!Array.isArray(d.rooms)) d.rooms = [];
+    if ((await mutate(d)) === false) return d;
+    await b.setRoom(u, d);
+    return d;
+  });
+  return b;
+};
+
 async function init({ uri, dbName, dataDir }) {
-  const file = fileBackend(dataDir);
+  const file = withUpdateRoom(fileBackend(dataDir));
   if (!uri) {
     console.log('[db] DB/MONGODB_URI 없음 → 로컬 JSON 파일 사용:', dataDir);
     file.data = await file.load();
     return file;
   }
-  const mongo = await mongoBackend(uri, dbName);
+  const mongo = withUpdateRoom(await mongoBackend(uri, dbName));
   mongo.data = await mongo.load();
   const empty = !Object.keys(mongo.data.users).length && !mongo.data.cfg.apiKey;
   if (empty) {

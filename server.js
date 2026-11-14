@@ -4,6 +4,7 @@ const { Readable } = require('stream');
 const block = require('./block');
 const dbmod = require('./db');
 const reasoning = require('./reasoning');
+const jobsmod = require('./jobs');
 const store = require('./store');
 const TOOLS = require('./tool_registry');
 const WS = require('./workspace');
@@ -128,6 +129,24 @@ const rawBody = (req, max) => new Promise((ok, no) => {
   req.on('end', () => ok(Buffer.concat(chunks).toString('utf8')));
   req.on('error', no);
 });
+
+// 백그라운드로 끝난 작업의 답변을 채팅방에 저장 (클라이언트가 붙어 있었어도 동일 내용이라 덮어써도 무방)
+async function persistJob(job) {
+  if (!job.roomId || job.status === 'error' || !job.answer.trim()) return;
+  await db.updateRoom(job.user, d => {
+    if (d.tomb[job.roomId]) return false;
+    const room = d.rooms.find(r => r.id === job.roomId); if (!room) return false;
+    const msgs = room.messages = Array.isArray(room.messages) ? room.messages : [];
+    if (msgs.some(x => x.jobId === job.id)) return false;
+    if (job.userText && msgs[msgs.length - 1]?.role !== 'user') {
+      msgs.push({ role: 'user', text: job.userText });
+      if (msgs.length === 1 && room.title === '새 대화') room.title = job.userText.slice(0, 32) || '새 대화';
+    }
+    msgs.push({ role: 'assistant', text: job.answer.trim(), jobId: job.id });
+    room.updatedAt = Date.now();
+    d.rooms.sort((x, y) => (y.updatedAt || 0) - (x.updatedAt || 0)); d.rev++;
+  });
+}
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x'), p = url.pathname, m = req.method;
@@ -330,20 +349,25 @@ const server = http.createServer(async (req, res) => {
 
     // ----- 계정별 채팅방 (기기 간 공유) -----
     if (p === '/api/rooms') {
-      const d = await db.getRoom(a.user);
-      if (m === 'GET') return url.searchParams.get('rev') === String(d.rev) ? send(res, 200, { rev: d.rev, same: true }) : send(res, 200, { rev: d.rev, rooms: d.rooms });
+      if (m === 'GET') {
+        const d = await db.getRoom(a.user);
+        return url.searchParams.get('rev') === String(d.rev) ? send(res, 200, { rev: d.rev, same: true }) : send(res, 200, { rev: d.rev, rooms: d.rooms });
+      }
       if (m === 'PUT') {
         const _b = await readBody(req, res); if (!_b) return;
         const { rooms = [], deleted = [] } = _b;
         if (!Array.isArray(rooms) || rooms.length > 300 || !Array.isArray(deleted)) return fail(res, 400, '잘못된 요청입니다.');
-        const map = new Map(d.rooms.map(r => [r.id, r]));
-        for (const id of deleted) { map.delete(id); d.tomb[id] = Date.now(); }
-        for (const r of rooms) {
-          if (!r || typeof r.id !== 'string' || !Array.isArray(r.messages) || d.tomb[r.id]) continue;
-          const old = map.get(r.id); if (!old || (r.updatedAt || 0) >= (old.updatedAt || 0)) map.set(r.id, r);
-        }
-        d.rooms = [...map.values()].sort((x, y) => (y.updatedAt || 0) - (x.updatedAt || 0)); d.rev++;
-        await db.setRoom(a.user, d); return send(res, 200, { rev: d.rev, rooms: d.rooms });
+        // 읽기→병합→쓰기를 사용자별로 직렬화 (동시 PUT · 백그라운드 작업 저장이 서로 덮어쓰지 않게)
+        const d = await db.updateRoom(a.user, d => {
+          const map = new Map(d.rooms.map(r => [r.id, r]));
+          for (const id of deleted) { map.delete(id); d.tomb[id] = Date.now(); }
+          for (const r of rooms) {
+            if (!r || typeof r.id !== 'string' || !Array.isArray(r.messages) || d.tomb[r.id]) continue;
+            const old = map.get(r.id); if (!old || (r.updatedAt || 0) >= (old.updatedAt || 0)) map.set(r.id, r);
+          }
+          d.rooms = [...map.values()].sort((x, y) => (y.updatedAt || 0) - (x.updatedAt || 0)); d.rev++;
+        });
+        return send(res, 200, { rev: d.rev, rooms: d.rooms });
       }
     }
 
@@ -416,6 +440,19 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // ----- 백그라운드 작업: 상태 조회 · 취소 (창을 닫았다 열어도 이어받기) -----
+    if (p === '/api/chat/job' && m === 'GET') {
+      const j = url.searchParams.get('active') ? jobsmod.active(a.user) : jobsmod.get(a.user, String(url.searchParams.get('id') || ''));
+      if (!j) return url.searchParams.get('active') ? send(res, 200, {}) : fail(res, 404, '작업을 찾을 수 없습니다.');
+      return send(res, 200, j.snapshot());
+    }
+    if (p === '/api/chat/cancel' && m === 'POST') {
+      const _b = await readBody(req, res); if (!_b) return;
+      const j = jobsmod.get(a.user, String(_b.id || ''));
+      if (j && j.status === 'running') j.ac.abort();
+      return send(res, 200, { ok: true });
+    }
+
     // ----- 채팅 (모든 기기가 관리자가 등록한 키를 사용) -----
     if (p === '/api/chat' && m === 'POST') {
       const apiKey = getKey();
@@ -427,6 +464,7 @@ const server = http.createServer(async (req, res) => {
       // 채팅 본문은 SQL/XSS 키워드가 정상 질문일 수 있음 → 프로토타입 오염·크기만 검사
       const _b = await readBody(req, res, { types: ['proto'] }); if (!_b) return;
       const { model, contents, temperature, noThink, reason } = _b;
+      const jobId = typeof _b.jobId === 'string' && /^[\w-]{6,64}$/.test(_b.jobId) ? _b.jobId : '';
       if (!/^[\w.\-]+$/.test(model || '') || !Array.isArray(contents) || !contents.length || contents.length > 60) return fail(res, 400, '잘못된 요청입니다.');
       // 추론 설정: reason = { level: 'low'|'medium'|'high'|'max' } — 비용은 서버 표(reasoning.LEVELS)가 결정
       const lv = reason && typeof reason === 'object' && typeof reason.level === 'string' && Object.hasOwn(reasoning.LEVELS, reason.level) ? reasoning.LEVELS[reason.level] : null;
@@ -436,12 +474,25 @@ const server = http.createServer(async (req, res) => {
       if (noThink && !lv) gen.thinkingConfig = { thinkingBudget: 0 };
       if (!a.admin) { bump('u:' + a.user, cost); bump('ip:' + ip(req), cost); }
       const refund = (n = cost) => { if (!a.admin) { bump('u:' + a.user, -n); bump('ip:' + ip(req), -n); } };
-      const ac = new AbortController(); res.on('close', () => ac.abort());
+      // 작업(job)으로 실행하면 브라우저 연결이 끊겨도 서버가 끝까지 생성하고 채팅방에 저장한다 (jobId 없는 구형 클라이언트는 기존 동작)
+      const job = jobId ? jobsmod.create({ user: a.user, id: jobId, roomId: typeof _b.roomId === 'string' ? _b.roomId.slice(0, 80) : '', userText: typeof _b.userText === 'string' ? _b.userText.slice(0, 20000) : '' }) : null;
+      if (jobId && !job) { refund(); return fail(res, 409, '이미 처리 중인 요청입니다.', H(usedOf(a, req))); }
+      const ac = job ? job.ac : new AbortController();
+      if (!job) res.on('close', () => ac.abort());
+      let finished = false;
+      const finish = (status, err) => {
+        if (!job || finished) return; finished = true; clearInterval(ka);
+        job.finish(status, err);
+        persistJob(job).catch(e => console.warn('[job] 저장 실패:', e.message));
+      };
+      // 프록시(Render 등)의 유휴 연결 종료 방지: 연결돼 있는 동안 주기적으로 주석 ping
+      const ka = setInterval(() => { if (res.headersSent && !res.writableEnded && !res.destroyed) res.write(': ping\n\n'); }, 15000);
+      res.on('close', () => clearInterval(ka));
 
       // 추론 모드는 단계 진행 상황을 먼저 흘려보내야 하므로 SSE 헤더를 미리 연다
       const early = !!lv;
-      const emit = o => { if (!res.writableEnded) res.write('data: ' + JSON.stringify(o) + '\n\n'); };
-      const openSSE = () => { res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no', ...H(usedOf(a, req)) }); res.flushHeaders(); };
+      const emit = o => { job?.record(o); if (!res.writableEnded && !res.destroyed) res.write('data: ' + JSON.stringify(o) + '\n\n'); };
+      const openSSE = () => { if (res.headersSent || res.destroyed) return; res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no', ...H(usedOf(a, req)) }); res.flushHeaders(); };
 
       // 파일/프로젝트 생성 요청 → 도구로 실제 파일 생성 (마크다운 코드블록 대신)
       const lastText = (() => {
@@ -464,9 +515,10 @@ const server = http.createServer(async (req, res) => {
           const tip = files.length ? '\n\n📁 작업 공간 파일: ' + files.map(f => f.path).join(', ') + '\n다운로드: GET /api/workspace/zip' : '';
           emit({ candidates: [{ content: { parts: [{ text: (r.text || '') + tip }] } }] });
           emit({ gims: { used: usedOf(a, req) } });
+          finish('done');
           return res.end();
         } catch (e) {
-          if (ac.signal.aborted && res.destroyed) { refund(); return res.end(); }
+          if (ac.signal.aborted) { refund(); finish('cancelled'); return res.end(); }
           console.warn('[files] 도구 실패 → 일반 응답:', e.message);
           emit({ gims: { id: 'files', label: '파일 도구 실패 → 일반 답변', state: 'done', ms: 0, detail: String(e.message || '').slice(0, 80) } });
           // fall through
@@ -484,7 +536,7 @@ const server = http.createServer(async (req, res) => {
           // 채팅·API·추론 단계/생각을 Mongo에 기록 (1초 주기 flush와 별도로 즉시 insert)
           db.logReason && db.logReason({ user: a.user, level: reason.level, model, stats: r.stats, system: String(r.system || '').slice(0, 4000), q: String((contents[contents.length-1]?.parts||[]).map(x=>x.text||'').join('')).slice(0, 2000) }).catch(()=>{});
         } catch (e) {
-          if (ac.signal.aborted && res.destroyed) { refund(); return res.end(); }
+          if (ac.signal.aborted) { refund(); finish('cancelled'); return res.end(); }
           console.warn('[reason] 실패 → 일반 응답으로 대체:', e.message);
           refund(cost - 1);
           emit({ gims: { id: 'fallback', label: '추론 실패 → 일반 답변으로 진행', state: 'done', ms: 0, detail: String(e.message || '').slice(0, 80), used: usedOf(a, req) } });
@@ -493,7 +545,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       const bail = (code, msg, raw) => {
-        refund();
+        refund(); finish(ac.signal.aborted ? 'cancelled' : 'error', msg);
         if (early) { emit({ gims: { used: usedOf(a, req) } }); emit({ error: { message: msg } }); return res.end(); }
         if (raw !== undefined) { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', ...H(usedOf(a, req)) }); return res.end(raw); }
         return fail(res, code, msg, H(usedOf(a, req)));
@@ -509,7 +561,24 @@ const server = http.createServer(async (req, res) => {
         return bail(e.status === 429 ? 429 : 502, msg);
       }
       if (!early) openSSE();
-      return Readable.fromWeb(up.body).on('error', () => res.end()).pipe(res);
+      if (!job) return Readable.fromWeb(up.body).on('error', () => res.end()).pipe(res);
+      // 작업 모드: 업스트림을 직접 읽어 (1) 답변을 기록하고 (2) 연결돼 있으면 그대로 전달한다
+      try {
+        const reader = up.body.getReader(), dec = new TextDecoder();
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          const s = dec.decode(value, { stream: true });
+          job.feed(s);
+          if (!res.writableEnded && !res.destroyed) res.write(s);
+        }
+        job.flush();
+        if (!job.answer.trim() && job.error) { refund(); finish('error'); } else finish('done');
+      } catch (e) {
+        if (!job.answer.trim()) refund();
+        finish(ac.signal.aborted ? 'cancelled' : 'error', e.message);
+      }
+      return res.end();
     }
     fail(res, 404, 'Not found');
   } catch (err) { if (!res.headersSent) fail(res, 500, err.message || '서버 오류'); else res.end(); }
