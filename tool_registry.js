@@ -7,6 +7,7 @@ const bigdata = require('./bigdata');
 const coding = require('./coding');
 const codingPlus = require('./coding_plus');
 const codingAnalyzer = require('./coding_analyzer');
+const luauTools = require('./luau_tools');
 const mathPlus = require('./math_plus');
 const mathProof = require('./math_proof');
 const external = require('./external');
@@ -18,7 +19,7 @@ const vserver = require('./vserver');
 
 const GROUPS = {
   math:     { decl: [...core.DECL.math, ...mathPlus.DECL, ...mathProof.DECL],         impl: { ...core.MATH, ...mathPlus.IMPL, ...mathProof.IMPL } },
-  coding:   { decl: [...core.DECL.coding, ...coding.DECL, ...codingPlus.DECL, ...codingAnalyzer.DECL], impl: { ...core.CODING, ...coding.IMPL, ...codingPlus.IMPL, ...codingAnalyzer.IMPL } },
+  coding:   { decl: [...core.DECL.coding, ...coding.DECL, ...codingPlus.DECL, ...codingAnalyzer.DECL, ...luauTools.DECL], impl: { ...core.CODING, ...coding.IMPL, ...codingPlus.IMPL, ...codingAnalyzer.IMPL, ...luauTools.IMPL } },
   data:     { decl: data.DECL,     impl: data.IMPL },
   bigdata:  { decl: bigdata.DECL,  impl: bigdata.IMPL },
   external: { decl: external.DECL, impl: external.IMPL },

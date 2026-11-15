@@ -1,10 +1,10 @@
 'use strict';
 // 사용자별 작업 공간 (메모리). AI가 만든 파일을 보관하고, zip 으로 내려받게 한다.
 // 제한: 파일 200개, 파일당 512KB, 공간당 5MB, 허용 확장자만, .env·node_modules·.git 금지, 유휴 3시간 후 삭제.
-const TTL = Number(process.env.WORKSPACE_TTL_MIN || 180) * 60_000;
+const TTL = Number(process.env.WORKSPACE_TTL_MIN || 720) * 60_000;   // 기본 12시간
 const MAX_FILES = 200, MAX_FILE = 512 * 1024, MAX_TOTAL = 5 * 1024 * 1024;
 const PATH_RE = /^[A-Za-z0-9_.][A-Za-z0-9_.\-\/]{0,199}$/;
-const EXT_OK = /\.(js|mjs|cjs|ts|json|html|css|md|txt|py|yml|yaml|csv|svg|gitignore|example|toml|sh)$/i;
+const EXT_OK = /\.(js|mjs|cjs|ts|json|html|css|md|txt|py|yml|yaml|csv|svg|gitignore|example|toml|sh|lua|luau|rbxmx|rbxlx|xml|ini|cfg|bat|ps1|ts|tsx|jsx|vue|sql|log|conf)$/i;
 const BLOCKED = /(^|\/)\.env($|\.)|(^|\/)node_modules\/|(^|\/)\.git\//i;
 const spaces = new Map();   // owner -> { files: Map<path, {content, bytes}>, bytes, t }
 
@@ -113,8 +113,9 @@ function zipStore(entries) {
   end.writeUInt32LE(cdSize, 12); end.writeUInt32LE(offset, 16); end.writeUInt16LE(0, 20);
   return Buffer.concat([...locals, ...centrals, end]);
 }
-function zip(owner) {
-  const files = allFiles(owner);
+function zip(owner, only) {
+  let files = allFiles(owner);
+  if (Array.isArray(only) && only.length) { const want = new Set(only); files = files.filter(f => want.has(f.path)); }
   if (!files.length) throw new Error('작업 공간에 파일이 없습니다');
   return zipStore(files.map(f => ({ name: f.path, data: f.content })));
 }

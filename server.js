@@ -399,15 +399,25 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/workspace' && m === 'DELETE') { WS.clear(a.user); return send(res, 200, { ok: true }); }
     if (p === '/api/workspace/file' && m === 'GET') {
       try {
-        const c = WS.readFile(a.user, url.searchParams.get('path') || '');
+        const fp = url.searchParams.get('path') || '';
+        const c = WS.readFile(a.user, fp);
+        if (url.searchParams.get('download')) {
+          // 진짜 파일로 내려받기: 파일 이름은 경로의 마지막 부분 (한글 등은 RFC 5987 로 인코딩)
+          const base = fp.split('/').pop() || 'file.txt';
+          const ascii = base.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+          const buf = Buffer.from(c, 'utf8');
+          res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(base)}`, 'Content-Length': buf.length, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
+          return res.end(buf);
+        }
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
         return res.end(c);
       } catch (e) { return fail(res, 404, e.message); }
     }
     if (p === '/api/workspace/zip' && m === 'GET') {
       try {
-        const buf = WS.zip(a.user);
-        res.writeHead(200, { 'Content-Type': 'application/zip', 'Content-Disposition': 'attachment; filename="workspace.zip"', 'Content-Length': buf.length, 'Cache-Control': 'no-store' });
+        const only = (url.searchParams.get('paths') || '').split(',').map(x => x.trim()).filter(Boolean).slice(0, 200);
+        const buf = WS.zip(a.user, only);
+        res.writeHead(200, { 'Content-Type': 'application/zip', 'Content-Disposition': `attachment; filename="${only.length ? 'files' : 'workspace'}.zip"`, 'Content-Length': buf.length, 'Cache-Control': 'no-store' });
         return res.end(buf);
       } catch (e) { return fail(res, 404, e.message); }
     }
@@ -499,21 +509,30 @@ const server = http.createServer(async (req, res) => {
         try { return (contents[contents.length - 1]?.parts || []).map(x => x.text || '').join(' '); }
         catch { return ''; }
       })();
-      const wantsFiles = !lv && /파일\s*(만들|생성|저장)|만들어\s*줘|작성해\s*줘|프로젝트\s*만들|index\.html|zip\s*(으로|로)|워크스페이스|실제\s*파일|코드\s*파일\s*만들/i.test(lastText);
+      // 파일 생성 요청 판정: 확실한 표현이면 바로, 막연한 "만들어줘" 는 코딩 의도일 때만
+      const strongFile = /(파일|file)\s*(로|을|를)?\s*(만들|생성|저장|작성|주세요|줘|달라|다운|받)|파일로|다운\s*로드|다운\s*받|\bzip\b|워크스페이스|실제\s*파일|프로젝트\s*(를\s*)?만들|index\.html|\.(lua|luau|js|ts|py|html|css|json|md|txt|sh|yml|csv)\s*(로|을|를)?\s*(만들|생성|저장|작성|줘)|(lua|luau|루아|루아우)\s*(파일|스크립트)\s*(만들|작성|생성|짜|줘)/i.test(lastText);
+      const weakFile = /(만들|작성|생성|짜)(어|해)?\s*(줘|주세요|달라)/.test(lastText) && ['coding', 'game', 'security'].includes(TOOLS.classify(lastText).intent);
+      const wantsFiles = strongFile || weakFile;
       if (wantsFiles) {
         openSSE();
         try {
           emit({ gims: { id: 'files', label: '파일 생성 도구 실행', state: 'start' } });
+          // 이번 요청에서 새로 만들어졌거나 바뀐 파일만 카드로 보여주기 위해 실행 전 상태를 기억한다
+          const before = new Map(WS.allFiles(a.user).map(f => [f.path, f.content]));
           const r = await TOOLS.runToolLoop({
             base: BASE, key: apiKey, model,
             system: AGENT_SYSTEM + '\n' + (SYSTEM_INSTRUCTION.parts[0]?.text || ''),
             groups: ['workspace', 'coding', 'vserver', 'sandbox'], mode: 'AUTO', maxRounds: 14, temperature: 0.25,
             signal: ac.signal, owner: a.user, contents
           });
-          const files = WS.listFiles(a.user);
-          emit({ gims: { id: 'files', label: '파일 생성 완료', state: 'done', ms: 0, detail: files.map(f => f.path).join(', ').slice(0, 160) } });
-          const tip = files.length ? '\n\n📁 작업 공간 파일: ' + files.map(f => f.path).join(', ') + '\n다운로드: GET /api/workspace/zip' : '';
-          emit({ candidates: [{ content: { parts: [{ text: (r.text || '') + tip }] } }] });
+          const changed = WS.allFiles(a.user).filter(f => before.get(f.path) !== f.content);
+          const sizes = new Map(WS.listFiles(a.user).map(f => [f.path, f.bytes]));
+          emit({ gims: { id: 'files', label: changed.length ? `파일 ${changed.length}개 생성 완료` : '파일 생성 완료', state: 'done', ms: 0, detail: changed.map(f => f.path).join(', ').slice(0, 160) } });
+          // :::files 블록은 화면에서 다운로드 카드로 바뀐다 (줄마다 "경로<TAB>바이트")
+          const card = changed.length ? '\n\n:::files\n' + changed.map(f => `${f.path}\t${sizes.get(f.path) || 0}`).join('\n') + '\n:::\n' : '';
+          const body = (r.text || '').trim() || (changed.length ? '요청하신 파일을 만들었어요.' : '파일을 만들지 못했어요. 요청을 조금 더 구체적으로 적어 주세요.');
+          emit({ candidates: [{ content: { parts: [{ text: body + card }] } }] });
+          if (lv) refund(cost - 1);   // 추론 모드에서 파일 도구로 처리한 경우 1회분만 차감
           emit({ gims: { used: usedOf(a, req) } });
           finish('done');
           return res.end();

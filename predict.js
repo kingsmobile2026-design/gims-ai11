@@ -10,7 +10,7 @@ const STR_LIST = description => ({ type: 'ARRAY', items: { type: 'STRING' }, des
 
 const INTENTS = {
   math:     { '계산': 2, '방정식': 3, '적분': 3, '미분': 3, '확률': 3, '행렬': 3, '수학': 3, '소수': 2, '최대공약수': 3, '공식': 2, 'integral': 3, 'derivative': 3, 'equation': 3, 'solve': 2, 'math': 2, 'prime': 2, 'factorial': 2, '증명': 3, '정수': 2, '나누어': 3, '제곱': 2, '나머지': 2, '모듈러': 2, '합동': 2, 'gcd': 3, 'lcm': 2, '인수': 2, '소수판정': 3, '이항': 2, '부등식': 2, '항등식': 3, '나누면': 2, '약수': 2, '배수': 2, 'divides': 3, 'modulo': 2, 'prove': 3, '증명하시오': 3, '보이시오': 3, '보여라': 2, '양의 정수': 3, '자연수': 2, '정수해': 3, '완전제곱': 3, '부정방정식': 3, '디오판토스': 3, '비에타': 3, '근과 계수': 3, '무한강하': 3, '강하법': 3, '귀납법': 2, '모듈러': 2, '합동식': 3, '정수론': 3, '올림피아드': 3, 'imo': 3, 'vieta': 3, 'descent': 2, 'diophantine': 3, 'congruence': 2, '이차방정식': 2, '약수': 2, '부등식': 2 },
-  coding:   { '코드': 3, '함수': 2, '버그': 3, '에러': 2, '오류': 2, '컴파일': 3, '구현': 2, '알고리즘': 2, '리팩터': 3, '테스트': 2, '시간복잡도': 3, 'python': 3, 'javascript': 3, 'typescript': 3, 'java': 2, 'code': 3, 'function': 2, 'bug': 3, 'class': 2, 'compile': 3, 'refactor': 3, 'algorithm': 2, 'debug': 3, 'node': 2, 'express': 2, 'html': 3, 'css': 2, 'index.html': 3, '웹': 2, '페이지': 2, '프론트': 2, '서버': 2, 'api': 2, '엔드포인트': 2, '스크립트': 2, '프로그램': 2, '앱': 2, '만들어': 2, '작성': 1, '게임': 1, '캔버스': 2, 'preview': 2, '실행': 1, '문법': 2, 'syntax': 2, 'runtime': 2, 'react': 2, 'vue': 2, 'dom': 2, 'fetch': 2, 'json': 1 },
+  coding:   { 'luau': 4, 'lua': 3, '루아': 3, '루아우': 4, 'roblox': 4, '로블록스': 4, '로블': 3, 'rojo': 3, 'getservice': 3, 'remoteevent': 3, '모듈스크립트': 3, 'modulescript': 3, '서버스크립트': 3, '로컬스크립트': 3, 'localscript': 3, '파일': 1, '다운로드': 1, '코드': 3, '함수': 2, '버그': 3, '에러': 2, '오류': 2, '컴파일': 3, '구현': 2, '알고리즘': 2, '리팩터': 3, '테스트': 2, '시간복잡도': 3, 'python': 3, 'javascript': 3, 'typescript': 3, 'java': 2, 'code': 3, 'function': 2, 'bug': 3, 'class': 2, 'compile': 3, 'refactor': 3, 'algorithm': 2, 'debug': 3, 'node': 2, 'express': 2, 'html': 3, 'css': 2, 'index.html': 3, '웹': 2, '페이지': 2, '프론트': 2, '서버': 2, 'api': 2, '엔드포인트': 2, '스크립트': 2, '프로그램': 2, '앱': 2, '만들어': 2, '작성': 1, '게임': 1, '캔버스': 2, 'preview': 2, '실행': 1, '문법': 2, 'syntax': 2, 'runtime': 2, 'react': 2, 'vue': 2, 'dom': 2, 'fetch': 2, 'json': 1 },
   data:     { '데이터': 3, 'csv': 3, '엑셀': 2, '집계': 3, '그룹': 2, '평균': 2, '통계': 3, '피벗': 3, '데이터셋': 3, '상관': 3, '이상치': 3, '시계열': 3, '결측': 3, 'dataset': 3, 'pivot': 3, 'aggregate': 2, 'json': 2, 'excel': 2, 'outlier': 3, 'missing': 2 },
   bigdata:  { '빅데이터': 3, '대용량': 3, '스트림': 3, '고유 개수': 3, '샘플링': 3, '분위수': 3, '근사': 2, 'big data': 3, 'hyperloglog': 3, 'bloom': 3, 'billion': 2, 'stream': 2, 'sketch': 3 },
   github:   { 'github': 3, '깃허브': 3, '레포': 3, '이슈': 2, '커밋': 3, 'pull request': 3, 'repo': 3, 'issue': 2, 'commit': 2, '풀리퀘스트': 3 },
@@ -67,6 +67,7 @@ function classify(text) {
     scores[intent] = sc;
   }
   // 구조적 힌트 가중치 (키워드만으로 놓치는 코딩 요청 보완)
+  if (/\blocal\s+function\b|game:GetService|script\.Parent|\bend\)?\s*$/m.test(s) && /\blocal\b|game:|script\./.test(s)) scores.coding = (scores.coding || 0) + 5;
   if (/```/.test(s)) scores.coding = (scores.coding || 0) + 4;
   if (/<!doctype|<html[\s>]|<script[\s>]/i.test(s)) scores.coding = (scores.coding || 0) + 5;
   if (/function\s*\(|=>\s*\{|def\s+\w+\s*\(|console\.log/.test(s)) scores.coding = (scores.coding || 0) + 3;
@@ -112,6 +113,7 @@ function languageOf(s) {
   if (/\bpython\b|파이썬|\bdef\s+\w+\(|^\s*import\s+\w+\s*$|\.py\b/im.test(s)) return 'python';
   if (/typescript|\.tsx?\b|:\s*(string|number)\b/i.test(s)) return 'ts';
   if (/<!doctype|<html|\bcss\b|index\.html|웹\s*페이지|html/i.test(s)) return 'html';
+  if (/\bluau?\b|루아|로블록스|roblox|game:GetService|\blocal\s+function\b/i.test(s)) return 'luau';
   if (/javascript|\bjs\b|node|express|react|const\s+\w+\s*=|=>|function\s*\(/i.test(s)) return 'js';
   if (/\bjava\b|\bc\+\+|\bgolang\b|\brust\b|\bkotlin\b|\bc#/i.test(s)) return 'other-lang';
   return null;

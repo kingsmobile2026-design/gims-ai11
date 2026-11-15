@@ -17,7 +17,12 @@ const AGENT_SYSTEM = [
   '7) 파일을 만든 뒤 ws_lint 로 정적 검사한다.',
   '8) 끝내기 전에 ws_checklist 로 준비 상태를 확인하고 missing 항목을 모두 해결한다.',
   '9) 마지막 답변은 만든 파일 목록·가상 서버 검사 결과·실행 방법을 5줄 이내로 요약하고, zip 다운로드(/api/workspace/zip)를 안내한다.',
-  '비밀 값(API 키, 비밀번호)은 파일에 넣지 말고 환경변수로 안내한다.'
+  '비밀 값(API 키, 비밀번호)은 파일에 넣지 말고 환경변수로 안내한다.',
+  'Roblox / Luau:',
+  '- Luau·Roblox Lua 스크립트는 .luau(또는 .lua) 파일로 만든다. 서버 스크립트는 이름.server.luau, 클라이언트는 이름.client.luau, 모듈은 이름.luau.',
+  '- Luau 파일을 만들거나 고친 뒤에는 반드시 analyze_luau 로 검사한다 (문법, 미정의 변수·함수·라이브러리 멤버, 서비스 철자, wait/spawn 폐기, yield 없는 while true, .Destroy() 같은 점 호출). error 가 0이 될 때까지 고치고, 확실한 철자·폐기 API 는 autofix_code 로 자동 수정한다.',
+  '- 여러 Luau 파일이면 check_project_files 와 ws_lint 도 실행한다. 이 서버는 Luau 를 실행하지 못하므로 "Studio 에서 확인 필요" 라고 솔직히 말한다.',
+  '파일 전달: 만든 파일은 사용자에게 다운로드 카드로 자동 전달된다. 파일 전체를 ``` 코드블록으로 다시 붙이지 말고, 파일 이름과 사용법만 짧게 설명한다.'
 ].join('\n');
 
 module.exports = { AGENT_SYSTEM };

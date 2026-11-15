@@ -7,6 +7,7 @@
 const WS = require('./workspace');
 const core = require('./reasoning_tools');
 const coding = require('./coding');
+const luau = require('./luau_analyzer');
 const codingPlus = require('./coding_plus');
 const sandbox = require('./sandbox');
 const { LIBS, TEMPLATES } = require('./lib');
@@ -99,6 +100,9 @@ function lintAll(owner) {
           const im = codingPlus.IMPL.check_imports({ code: f.content, package_json: pkgFile.content });
           for (const m of im.missingInPackageJson || []) add(f.path, null, 'error', `package.json 에 없는 패키지: ${m} (ws_add_dependency 로 추가)`);
         }
+      } else if (ext === 'lua' || ext === 'luau') {
+        const r = luau.analyzeLuau(f.content, { filename: f.path });
+        for (const i of r.issues) add(f.path, i.line, i.sev === 'error' ? 'error' : i.sev === 'warning' ? 'warning' : 'info', `[${i.rule}] ${i.message}${i.suggestion ? ' → ' + i.suggestion : ''}`);
       } else if (ext === 'py') {
         const br = coding.IMPL.check_brackets({ code: f.content, language: 'python' });
         if (!br.ok) add(f.path, br.line, 'error', br.error);

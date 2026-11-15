@@ -195,6 +195,53 @@ const TEMPLATES = {
       ].join('\n')
     }
   },
+  'roblox-rojo': {
+    description: 'Roblox(Luau) 프로젝트: Rojo 구성 + 서버/클라이언트/공유 모듈',
+    next: 'analyze_luau 로 각 .luau 파일을 검사하세요. Roblox Studio + Rojo 로 동기화해서 확인합니다.',
+    files: {
+      'default.project.json': JSON.stringify({
+        name: 'game',
+        tree: {
+          $className: 'DataModel',
+          ReplicatedStorage: { Shared: { $path: 'src/shared' } },
+          ServerScriptService: { Server: { $path: 'src/server' } },
+          StarterPlayer: { StarterPlayerScripts: { Client: { $path: 'src/client' } } }
+        }
+      }, null, 2) + '\n',
+      'src/shared/Util.luau': [
+        '--!strict',
+        'local Util = {}',
+        '',
+        'function Util.clamp01(x: number): number',
+        '\treturn math.clamp(x, 0, 1)',
+        'end',
+        '',
+        'return Util',
+        ''
+      ].join('\n'),
+      'src/server/Main.server.luau': [
+        '--!strict',
+        'local Players = game:GetService("Players")',
+        'local ReplicatedStorage = game:GetService("ReplicatedStorage")',
+        '',
+        'local Util = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Util"))',
+        '',
+        'Players.PlayerAdded:Connect(function(player: Player)',
+        '\tprint(player.Name, Util.clamp01(2))',
+        'end)',
+        ''
+      ].join('\n'),
+      'src/client/Main.client.luau': [
+        '--!strict',
+        'local Players = game:GetService("Players")',
+        '',
+        'local player = Players.LocalPlayer',
+        'print("client ready:", player.Name)',
+        ''
+      ].join('\n'),
+      'README.md': '# Roblox 프로젝트\n\n`rojo serve` 로 Roblox Studio 와 동기화합니다.\n'
+    }
+  },
   'python-cli': {
     description: 'Python 명령줄 도구 + unittest 테스트',
     next: 'ws_sandbox_run 으로 실제 실행 결과를 확인하세요.',

@@ -11,6 +11,7 @@
  */
 const { spawn } = require('child_process');
 const A = require('./js_analyzer');
+const LU = require('./luau_analyzer');
 
 const MAX_CODE = 60_000;
 const S = (type, description, extra = {}) => ({ type, description, ...extra });
@@ -33,10 +34,19 @@ function normLang(l) {
   if (x === 'json') return 'json';
   if (x === 'css') return 'css';
   if (['ts', 'typescript', 'tsx'].includes(x)) return 'ts';
+  if (['lua', 'luau', 'roblox', 'robloxlua', 'rbx'].includes(x)) return 'luau';
   return x || 'auto';
+}
+const LUAU_HINT = /\blocal\s+function\b|\bgame:GetService\s*\(|\bgame\.(Players|Workspace|ReplicatedStorage)\b|\bscript\.Parent\b|\blocal\s+\w+(\s*:\s*[\w.?{}<>\[\]| ]+)?\s*=[^=]|\bthen\s*$|^\s*--!(strict|nonstrict|nocheck)/m;
+function looksLuau(src) {
+  if (!LUAU_HINT.test(src) || !/\bend\b/.test(src)) return false;
+  if (/\b(const|let|var)\s+\w+\s*=|=>|\bfunction\s*\w*\s*\([^)]*\)\s*\{|;\s*$/m.test(src)) return false;   // JS 신호가 있으면 아님
+  if (/^\s*def\s+\w+\(.*\):\s*$/m.test(src)) return false;
+  return true;
 }
 function detectLanguage(src) {
   const t = src.trimStart();
+  if (looksLuau(src)) return 'luau';
   if (/^<!doctype html|^<html[\s>]|^<(head|body|div|script|style)[\s>]/i.test(t)) return 'html';
   if (/^[\[{]/.test(t)) { try { JSON.parse(src); return 'json'; } catch { if (/^\s*[\[{]\s*"[^"\n]*"\s*:/.test(src) && !/;|\bfunction\b|=>/.test(src)) return 'json'; } }
   const py = (/^\s*def\s+\w+\s*\(.*\)\s*(->\s*[\w\[\], .]+)?:\s*$/m.test(src) || /^\s*(import \w+|from [\w.]+ import )/m.test(src) && !/;\s*$/m.test(src)) || /^\s*(elif .*:|except\b.*:|print\s*\(.*\)\s*$)/m.test(src) && !/[{};]\s*$/m.test(src);
@@ -561,7 +571,7 @@ function analyzeHtml(src, extra = {}) {
 // ---------------------------------------------------------------------------
 // 통합 진입점
 // ---------------------------------------------------------------------------
-async function analyze({ code, language, env, globals }) {
+async function analyze({ code, language, env, globals, context, filename }) {
   const src = codeOf(code);
   if (!src.trim()) throw new Error('code 가 비어 있습니다');
   let lang = normLang(language);
@@ -570,6 +580,7 @@ async function analyze({ code, language, env, globals }) {
   switch (lang) {
     case 'js': { const r = analyzeJsFull(src, o); return { language: 'js', stage: r.stage, issues: r.issues, functions: r.functions, syntax: r.syntax, env: r.r && r.r.env, raw: r }; }
     case 'python': { const r = await analyzePython(src); return { language: 'python', engine: r.engine, stage: r.stage, issues: r.issues, functions: r.functions, note: r.note, syntax: r.syntax }; }
+    case 'luau': { const r = LU.analyzeLuau(src, { env: env === 'luau' ? 'luau' : 'roblox', extraGlobals: o.extraGlobals, context, filename }); return { language: 'luau', stage: r.stage, issues: r.issues, functions: r.functions, syntax: r.syntax, env: env === 'luau' ? 'luau' : 'roblox' }; }
     case 'html': { const r = analyzeHtml(src, { globals: o.extraGlobals }); return { language: 'html', issues: r.issues, functions: [], extra: { scripts: r.scripts, ids: r.ids } }; }
     case 'json': return { language: 'json', ...analyzeJson(src), functions: [] };
     case 'css': return { language: 'css', ...analyzeCss(src), functions: [] };
@@ -596,10 +607,20 @@ IMPL.analyze_code = async ({ code, language, env, globals }) => {
 
 IMPL.find_undefined_symbols = async ({ code, language, env, globals }) => {
   const r = await analyze({ code, language, env, globals });
-  const rules = new Set(['undefined-variable', 'undefined-function', 'undefined-name', 'undefined-method', 'undefined-member', 'undefined-property', 'undefined-attribute', 'undefined-module-member', 'undefined-handler', 'implicit-global', 'use-before-define', 'syntax', 'brackets', 'bad-import', 'missing-element']);
+  const rules = new Set(['undefined-variable', 'undefined-function', 'undefined-name', 'undefined-method', 'undefined-member', 'undefined-property', 'undefined-attribute', 'undefined-module-member', 'undefined-handler', 'undefined-field', 'bad-service', 'implicit-global', 'use-before-define', 'syntax', 'brackets', 'bad-import', 'missing-element']);
   const issues = r.issues.filter(i => rules.has(i.rule));
   return pack({ language: r.language, stage: r.stage, undefinedCount: issues.filter(i => i.rule !== 'syntax').length }, issues.map(stripInternal));
 };
+
+IMPL.analyze_luau = async ({ code, env, globals, context, filename }) => analyze({ code, language: 'luau', env, globals, context, filename }).then(r => {
+  const frame = r.syntax && !r.syntax.ok && r.syntax.frame ? r.syntax.frame : null;
+  const packed = pack({ language: 'luau', stage: r.stage, env: r.env }, r.issues.map(stripInternal), { budget: frame ? 4300 : 5200 });
+  if (frame) packed.frame = frame;
+  if (r.stage === 'syntax') packed.next = '문법 오류를 먼저 고친 뒤 다시 analyze_luau 를 호출해야 미정의 이름 검사가 수행됩니다';
+  else if (!packed.counts.error && !packed.counts.warning) packed.next = '오류 없음. Roblox Studio 에서 실제 동작을 확인하세요 (이 서버는 Luau 를 실행하지 않습니다)';
+  else packed.next = 'error 를 먼저 고치고, 확실한 철자·폐기 API 는 autofix_code 로 자동 수정할 수 있습니다';
+  return packed;
+});
 
 IMPL.analyze_html_page = ({ html }) => {
   const r = analyzeHtml(codeOf(html, 'html'));
@@ -628,7 +649,8 @@ IMPL.review_code = async ({ code, language }) => {
 IMPL.autofix_code = async ({ code, language }) => {
   const src = codeOf(code);
   const lang = normLang(language) === 'auto' ? detectLanguage(src) : normLang(language);
-  if (lang !== 'js') throw new Error('autofix_code 는 JavaScript 만 지원합니다 (다른 언어는 analyze_code 의 fix 힌트를 참고)');
+  if (lang === 'luau') { const r = LU.autofixLuau(src, {}); return r.changed && r.fixed_code.length > 4500 ? { ...r, fixed_code: undefined, note: '코드가 길어 changes 목록대로 직접 수정하세요' } : { ...r, note: r.changed ? '철자·폐기 API·: 호출 같은 확실한 항목만 고쳤습니다. 의도와 맞는지 확인하세요' : undefined }; }
+  if (lang !== 'js') throw new Error('autofix_code 는 JavaScript·Luau 만 지원합니다 (다른 언어는 analyze_code 의 fix 힌트를 참고)');
   const r = analyzeJsFull(src, {});
   if (r.stage !== 'analysis') return { changed: false, reason: '문법 오류가 있어 자동 수정을 건너뜁니다. analyze_code 로 먼저 문법 오류를 고치세요' };
   const lineStarts = [0];
@@ -695,6 +717,15 @@ IMPL.check_project_files = async ({ files }) => {
         const target = norm((dirOf(p) ? dirOf(p) + '/' : '') + m[1].split(/[?#]/)[0]);
         if (!map.has(target)) issues.push({ sev: 'error', rule: 'missing-file', file: p, line: c.slice(0, m.index).split('\n').length, message: `참조한 파일 '${m[1]}' 이(가) 프로젝트에 없습니다` });
       }
+    } else if (/\.luau?$/i.test(p)) {
+      const r = LU.analyzeLuau(c, { filename: p });
+      r.issues.filter(i => i.sev !== 'info').forEach(i => issues.push(tag(stripInternal(i))));
+      if (r.ast) for (const rq of LU.requiresOf(r.ast)) {
+        if (rq.str || !rq.name) continue;
+        const names = [...map.keys()].map(k => k.split('/').pop().replace(/\.(luau?)$/i, '').replace(/^init$/, '')).concat([...map.keys()].map(k => k.split('/').slice(-2, -1)[0] || ''));
+        const roots = new Set(['script', 'game', 'ReplicatedStorage', 'ServerScriptService', 'ServerStorage', 'ReplicatedFirst', 'StarterPlayer', 'workspace']);
+        if (roots.has(rq.root) && !names.includes(rq.name) && /^[A-Z]/.test(rq.name) && rq.chain.length <= 4) issues.push({ sev: 'warning', rule: 'missing-module', file: p, line: rq.line, message: `require 하는 '${rq.name}' 모듈 파일이 프로젝트에 없습니다`, suggestion: `후보: ${[...map.keys()].filter(k => /\.luau?$/i.test(k)).slice(0, 6).join(', ')}` });
+      }
     } else if (/\.json$/.test(p)) analyzeJson(c).issues.forEach(i => issues.push(tag(i)));
     else if (/\.py$/.test(p)) (await analyzePython(c)).issues.filter(i => i.sev === 'error').forEach(i => issues.push(tag(i)));
     else if (/\.css$/.test(p)) analyzeCss(c).issues.forEach(i => issues.push(tag(i)));
@@ -727,11 +758,13 @@ IMPL.check_project_files = async ({ files }) => {
   return pack({ files: map.size }, issues, { budget: 5400 });
 };
 
-const LANG_PROP = S('STRING', '언어 (auto/js/python/html/json/css). 기본 auto');
+const LANG_PROP = S('STRING', '언어 (auto/js/python/html/json/css/luau). 기본 auto. Roblox Lua 는 luau');
 const GLOBALS_PROP = { type: 'ARRAY', items: { type: 'STRING' }, description: '이미 정의돼 있다고 가정할 전역 이름 (다른 파일/CDN 에서 오는 이름)' };
 const DECL = [
   { name: 'analyze_code', description: '코드를 실행하지 않고 종합 점검한다: 문법 오류(줄·칸·코드 프레임·원인 힌트), 정의되지 않은 변수·함수·메서드(오타 후보), 선언 전 사용(TDZ), const 재대입, 인자 개수 불일치, 도달 불가 코드, await 누락, 대입 조건문, 오타 난 내장 함수(Math.flor, console.lgo, getElementByID). JS·Python·HTML·JSON·CSS 지원. 코드를 작성하거나 고친 뒤 답하기 전에 반드시 호출하고, error 가 0이 될 때까지 고쳐 다시 호출하라.',
     parameters: OBJ({ code: S('STRING', '검사할 코드 전체'), language: LANG_PROP, env: S('STRING', 'JS 실행 환경', { enum: ['auto', 'node', 'browser', 'both'] }), globals: GLOBALS_PROP }, ['code']) },
+  { name: 'analyze_luau', description: 'Luau / Roblox Lua 코드를 실행하지 않고 점검한다: 문법 오류(줄·칸·어느 줄의 end 가 빠졌는지), 정의되지 않은 변수·함수(오타 후보), 위에서 쓰고 아래에서 local 선언한 순서 문제, 없는 라이브러리 멤버(math.flor, task.Wait, Vector3.New), 없는 서비스 이름, 암묵 전역, 정의되지 않은 모듈 필드, 미사용 local, Roblox 함정(yield 없는 while true, wait/spawn 폐기, .Destroy() 처럼 : 대신 . 호출, FindFirstChild 결과 바로 인덱싱, :Connect(f()) 등). 파일을 만든 뒤 반드시 실행하라.',
+    parameters: OBJ({ code: S('STRING', 'Luau 코드 전체'), env: S('STRING', 'roblox(기본: game·workspace 등 Roblox 전역 허용) 또는 luau(표준 Luau 만)', { enum: ['roblox', 'luau'] }), context: S('STRING', '스크립트 종류: server(Script) / client(LocalScript) / module. 서버·클라 전용 API 를 잘못 쓰면 잡는다', { enum: ['server', 'client', 'module'] }), filename: S('STRING', '파일 이름 (예: Main.server.luau — 이름으로 server/client 자동 판정)'), globals: GLOBALS_PROP }, ['code']) },
   { name: 'find_undefined_symbols', description: '정의되지 않은 변수·함수·메서드·import 와 문법 오류만 빠르게 찾는다(오타 후보 포함). "X is not defined" 류 오류의 원인을 추적할 때 사용.',
     parameters: OBJ({ code: S('STRING', '코드'), language: LANG_PROP, env: S('STRING', 'JS 환경', { enum: ['auto', 'node', 'browser', 'both'] }), globals: GLOBALS_PROP }, ['code']) },
   { name: 'analyze_html_page', description: 'HTML 한 파일(내장 JS/CSS 포함)을 교차 검사한다: 태그 짝, 중복 id, 스크립트 문법·미정의 이름, onclick 등 인라인 핸들러가 부르는 함수 존재 여부, getElementById 대상 요소 존재 여부, canvas 누락.',
